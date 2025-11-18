@@ -1,9 +1,0 @@
-{
-	"name": "creeper-spiderbots",
-	"version": "1.0.0",
-	"title": "Creeper Spiderbots",
-	"author": "Ceeloman",
-	"factorio_version": "2.0",
-	"dependencies": ["base >= 2.0", "spiderbots"],
-	"description": "Adds small explosive spider robots that autonomously hunt enemy nests and self-destruct."
-  }

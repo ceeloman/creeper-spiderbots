@@ -1,0 +1,17 @@
+---------------------------------------------------------------------------------------------------
+Version: 1.2.0
+Date: 2025-04-26
+  Copmatibility:
+   - AAI Vehicles: Miner - the Mining Vehicle MK5 exceeded the 1 ton weight limit - the vehicle can now be sent to orbit
+   - Hovercrafts - Missile Hovercraft exceeded the 1 ton weight limit - the vehicle can now be sent to orbit
+   - Spiderbots - Brought forward the Spiderbot MK2 technology to unlock alongside Spiderbots
+---------------------------------------------------------------------------------------------------
+Version: 1.1.0
+Date: 2025-04-21
+  Bugfix:
+   - Incorrect file path
+---------------------------------------------------------------------------------------------------
+Version: 1.0.0
+Date: 2025-04-21
+  Features:
+    - Added a tweak for Spiderbots by Ashersky

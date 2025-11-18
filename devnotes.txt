@@ -1,0 +1,92 @@
+1. Make Creepers bigger
+2. Make different technologies for explosion sizes
+3. Speed modifier that works 
+4. Smarter searching
+5. Reduce health
+6. Explode on death if killed by biters
+7. Squad search parties (acting like ants - when a nest is located a signal is sent out attracting other bombers to the target)
+8. Squad targetting - stop more than needed bots from targetting one nest
+9. Faster explosion - arriv`e then explode (at least make the explosions random between 0-1 seconds or something)
+10. Make stack size to 25
+11. Start hunting when they are deployed from orbit too
+12. Target Demolishers and pentapods
+13. Make a smaller remnant
+14. Dodging mechanic to avoid biters?
+
+I want to create a few new states. lets discuss first before writing code, please ask about code that i already have rather than creating new functions
+
+Wake up- 
+1. Upon placing the bot will visible initlaise, we acheive this by making it move to a few locations within a short distance from its spawn location.
+so random number of movements, most likely to do 2 movements, but randomly may do more to make it look natural
+2.Selected locations will be within 5 tiles up down left and right of the spawn location.
+3. Upon being created they will quickly scan for immediate danger, that means if they are within 30 tiles of enemies they go into approach mode. 
+4. if not in immediate danger they move into the grouping stage
+
+Grouping
+1. the creeper bots will form search parties for targets similar to how the biter do it in factorio
+2. I open to this logic being changed and made more sense code wise
+3. within 10 seconds a bot will assign itself as a leader, with other bots that move into the grouping stage within 50 tiles, will move towards and join a leaders group.
+4. while in the grouping stage, the bots will randomly infrequently move around the leader a few tiles similar to waking so it doesnt look like they are standing around.
+5. Leader and followers need their own states?
+6. when assigning as a leader, there will be a check to see if any bots within 30 tiles have assigned themselves as a leader within the last 120 ticks, if so,they will cancel and join as a follower.
+7. The group sizes should be random, with evolution factor increasing the minimal threshold of bots in a group before initiating a scouting party luasurface: get_evolution_factor
+8. there will be a short delay for groups before they can head out. this gives the player to place all the creeper bots it wants, let them form up
+9. these checks should be at the end, has the first bot been placed more than 10 seconds ago, has the last bot to join the group been within the group for more than 2 seconds.
+10. there should be a limit on the group sizes, more and more bots being placed will stop the group from leaving, this would result in ridiculous group sizes.
+11. a note on the grouping, the bot queues to join a group, and only officially registers as joined when it arrives near the leader location.
+12. the entity names are creeperbot, creeperbot-mk2, and creeperbot-mk3-nuclear
+13. bots should prefer to assign the smaller bots as leaders as tehy are faster and the rest of the group can keep up and not overtake
+14. nuclear bots can never be leaders unless no other bot types are in the area
+
+
+Scouting
+1. Once the party has formed, the checks have been complete the group should assign team leaders. by diving the group in say 3, then the rest of the followers choose a leader, or team leader to follow
+2. once all assigned, the leader scans for a suitable target location to send the scouting party to.
+3. then the team leaders get locations near by, within 8 tiles of the scouting destination, and preferably calculate shorter distance so the bots dont overshoot
+4. we already a have function for processing waypoints, where the bots hitting waypoitns checks for enemy targets in range.
+5. if a finds a target it tells the group to move into prepare to attack mode
+6. once the bots reach their waypoints, the followers stay following their assigned leader, the team leaders path closer to the leader. then the leader initiates another scout, it does not move into the grouping stage.
+
+Preparing to attack
+1. when the bots locate an enemy spawner they turn red. 
+2. the leader moves to distractor state steps a few steps closer towards the target, if the biters start targetting the bots, we hope its that one. (more on distractor state later)
+3. the group individually cycles through the bots and the bots choose a target, smaller bots choose their targets first.
+4. targets are assigned by health, for example the creeperbot mk1 does 400 damage, a nest for example takes 1000 damage, so 3 mk1s would be assigned to that nest, mk2 do example 600 damage so two would target a nest
+5. nuclear creepers prefer to target in between nests as they have larger blast radius, and prefering to move into attack last (we may not need to worry about making them attack last because the bigger bots are slower and naturally move in last)
+6. once all assigned, the distractor moves in first around half a second before, once it gains more than 5 more biters trying to attack it it diverts angle taking the biters away to clear a route for the rest of the group
+7. the rest of the group moves in for attack
+
+distractor
+1. so they move in when they start to get attacked by 5 enemies they divert to the left or right hopefullying bringing enemies away
+2. if they are the target of more than 10, they walk for a little bit stop, then explode, trying to take out as many enemies with them
+3. if they have less than 10 then they find a nest to target
+
+if the enemy target is destoryd before arriving the bots then pick another target
+if all the bases are destroyed an no targets within 30 tiles, whats left of the group forms up and goes on another scouting expidition
+(this logic here, if one bot is placed and no other bots join the group, then they head out after a certain amount of time( this should be a setting that can be configured ))
+no matter the group size of whats left, they form up, and head out again
+
+
+
+
+
+
+1. when first placed, if not enemies in close proximity (30 tiles) immedieate danger then group up, if in immediate danger initiate attack
+
+2. when first placed, the group cannot leave for 15 seconds allowing the player to palce all the entities it wants to for the group, 
+
+3. when attacking, the leader should get some distance from the hive, look like its looking at it, lets the group assign targets, calculating damage each unit puts out. for example a nest takes 3 mk1 explosions to destroy, so the group will assign 3-4 bots to that nest. at this point they change state from grouping and scouting to preparing for attack
+
+4. if the bots are being attacked then unit that is the target disperses from the group takign the biters away and self destructs, while the rest of the group analyses
+
+5. would be cool if the enemy biter sizes are large that the bots send a distractor bot in, which runs in , and draws some out, then the rest of the bots can run in
+
+6. nuclear spiders shouold never be the distractors, their speed means they will be the last to arrive after preparing to attack, no more than 1 nuclear spider per group. preferring to target in the middle of hte nest cluster than not, and preferring to not target spitters
+
+7. so i run a test, and the group of say 10 head out and found a group of nests on its first final desintaiont. which they attackde, one blew up the rest followed, but didnt attack
+
+8. in the preparing to attack phase, one is designated the distractor stepping slightly closer to the nest target, becoming yellow, if it gets less than 5 enemies targetting it then find a nest to attack, absorbing hits from the biters, if more are attacking it then keep runnning, when low on health, stop explode
+
+9. antoerh group set out, at the end of the walk they grouped up but didnt initate another scouting path
+
+10. a bot lost it leader right next to an enemy spawner, and ti decided to wait for a group instead of attacking, if its in immediate danger initiate an attack

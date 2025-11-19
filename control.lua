@@ -24,6 +24,9 @@ local function initialize_storage()
     storage.path_requests = storage.path_requests or {}
     storage.scheduled_autopilots = storage.scheduled_autopilots or {}
     storage.leader_candidates = storage.leader_candidates or {}
+    storage.territory = storage.territory or {}  -- Global chunk territory tracking by surface
+    storage.territory_visualization = storage.territory_visualization or {}  -- Per-player visualization state
+    storage.pending_teleports = storage.pending_teleports or {}  -- Store creeperbot state for teleportation restoration
 end
 
 -- Register a Creeperbot entity
@@ -33,6 +36,130 @@ local function handle_entity_creation(event)
         register_creeperbot(entity)
         log("Registered Creeperbot " .. entity.unit_number)
     end
+end
+
+-- Handle creeperbot created by projectile (teleportation)
+local function handle_trigger_created_entity(event)
+    local entity = event.entity
+    if not (entity and entity.valid and is_creeperbot(entity.name)) then
+        return
+    end
+    
+    local source = event.source
+    if not (source and source.valid) then
+        return
+    end
+    
+    -- Check if this is a teleported bot (has stored state)
+    -- We use the source entity's unit_number to find the pending teleport
+    -- Since the source is the old entity that was destroyed, we need to match by position or use a different method
+    -- Actually, we'll store by the old unit_number and match when the new entity is created
+    
+    -- For now, register normally - we'll restore state after registration
+    register_creeperbot(entity)
+    
+    -- Try to find and restore state from pending teleports
+    -- We match by finding the closest pending teleport to the new entity's position
+    if storage.pending_teleports then
+        local best_match = nil
+        local best_distance = math.huge
+        local match_key = nil
+        
+        for key, teleport_data in pairs(storage.pending_teleports) do
+            if teleport_data.bot_name == entity.name then
+                local distance = calculate_distance(entity.position, teleport_data.destination)
+                if distance < 10 and distance < best_distance then  -- Within 10 tiles of destination
+                    best_distance = distance
+                    best_match = teleport_data
+                    match_key = key
+                end
+            end
+        end
+        
+        if best_match then
+            -- Restore the creeperbot's state
+            local creeper = storage.creeperbots[entity.unit_number]
+            if creeper then
+                -- Restore state
+                creeper.state = best_match.state
+                creeper.party_id = best_match.party_id
+                creeper.is_leader = best_match.is_leader
+                creeper.is_guard = best_match.is_guard
+                creeper.is_distractor = best_match.is_distractor
+                creeper.target = best_match.target
+                creeper.target_position = best_match.target_position
+                creeper.target_health = best_match.target_health
+                
+                -- Restore follow target if it was set
+                if best_match.follow_target and best_match.follow_target.valid then
+                    entity.follow_target = best_match.follow_target
+                end
+                
+                -- Update color based on restored state
+                update_color(entity, creeper.state)
+                
+                log("Restored creeperbot " .. entity.unit_number .. " state after teleportation")
+            end
+            
+            -- Clean up pending teleport
+            storage.pending_teleports[match_key] = nil
+        end
+    end
+end
+
+-- Create a projectile that spawns a creeperbot where it lands (for teleportation)
+-- @param origin MapPosition - where the projectile starts
+-- @param destination MapPosition - where the projectile lands
+-- @param creeper table - the creeperbot data to preserve
+-- @param speed_multiplier number? - multiplier for projectile speed
+-- @param speed_override number? - override speed (if provided, speed_multiplier is ignored)
+local function create_creeperbot_projectile(origin, destination, creeper, speed_multiplier, speed_override)
+    if not (creeper and creeper.entity and creeper.entity.valid) then
+        return
+    end
+    
+    local entity = creeper.entity
+    local surface = entity.surface
+    if not (surface and surface.valid) then
+        return
+    end
+    
+    -- Store creeperbot state for restoration after teleportation
+    local teleport_key = "teleport_" .. entity.unit_number .. "_" .. game.tick
+    storage.pending_teleports = storage.pending_teleports or {}
+    storage.pending_teleports[teleport_key] = {
+        bot_name = entity.name,
+        destination = destination,
+        state = creeper.state,
+        party_id = creeper.party_id,
+        is_leader = creeper.is_leader,
+        is_guard = creeper.is_guard,
+        is_distractor = creeper.is_distractor,
+        target = creeper.target,
+        target_position = creeper.target_position,
+        target_health = creeper.target_health,
+        follow_target = entity.follow_target,
+    }
+    
+    -- Create the projectile
+    local projectile_name = entity.name .. "-trigger"
+    local source_entity = entity.follow_target or entity
+    if not (source_entity and source_entity.valid) then
+        source_entity = entity
+    end
+    
+    surface.create_entity {
+        name = projectile_name,
+        position = origin,
+        force = entity.force,
+        source = source_entity,
+        target = destination,
+        speed = speed_override or (math.random() * (speed_multiplier or 1)),
+        raise_built = true,
+    }
+    
+    -- Destroy the old entity
+    entity.destroy({ raise_destroy = true })
 end
 
 -- Clean up a Creeperbot from storage and party
@@ -122,7 +249,7 @@ local function handle_entity_death(event)
                 end
                 -- Create additional atomic explosions
                 for _ = 1, 3 do
-                    surface.create_entity({name = "atomic-explosion", position = position})
+                    surface.create_entity({name = "nuke-effects-nauvis", position = position})
                 end
                 -- Create extra effect if specified
                 if tier.extra_effect then
@@ -226,6 +353,64 @@ local function process_scheduled_autopilots(event)
                 log("Unit " .. unit_number .. " applied autopilot to (" .. scheduled.destination[1].x .. "," .. scheduled.destination[1].y .. ")")
             end
         end
+    end
+end
+
+-- Check if creeperbots are too far from their follow target and teleport them closer
+local function check_and_teleport_stuck_bots(event)
+    -- Distance thresholds (in tiles)
+    local max_range = 150  -- Normal max range
+    local double_max_range = 300  -- Greatly exceeds range
+    
+    for unit_number, creeper in pairs(storage.creeperbots or {}) do
+        if not (creeper.entity and creeper.entity.valid) then
+            goto continue
+        end
+        
+        local entity = creeper.entity
+        local follow_target = entity.follow_target
+        
+        -- Only check bots that have a follow target
+        if not (follow_target and follow_target.valid) then
+            goto continue
+        end
+        
+        -- Skip bots that are in certain states (they should handle their own movement)
+        if creeper.state == "exploding" or creeper.state == "approaching" then
+            goto continue
+        end
+        
+        -- Check if bot is on the same surface as follow target
+        if entity.surface_index ~= follow_target.surface_index then
+            -- Different surface - teleport to follow target's surface
+            local position_in_radius = get_random_position_in_radius(follow_target.position, 50)
+            -- Use character as a generic entity type for collision checking
+            local non_colliding_position = follow_target.surface.find_non_colliding_position("character", position_in_radius, 50, 0.5)
+            local position = non_colliding_position or follow_target.position
+            create_creeperbot_projectile(entity.position, position, creeper, 1, 0.25)
+            log("Teleporting creeperbot " .. unit_number .. " to different surface")
+            goto continue
+        end
+        
+        -- Calculate distance to follow target
+        local distance_to_target = calculate_distance(entity.position, follow_target.position)
+        local no_speed = (entity.speed == 0)
+        local exceeds_range = distance_to_target > max_range
+        local greatly_exceeds_range = distance_to_target > double_max_range
+        
+        -- Teleport if bot is stuck (no speed) and exceeds range, or greatly exceeds range
+        if (no_speed and exceeds_range) or greatly_exceeds_range then
+            local position_in_radius = get_random_position_in_radius(follow_target.position, 50)
+            -- Use character as a generic entity type for collision checking
+            local non_colliding_position = follow_target.surface.find_non_colliding_position("character", position_in_radius, 100, 0.5)
+            
+            if non_colliding_position then
+                create_creeperbot_projectile(entity.position, non_colliding_position, creeper, 5)
+                log("Teleporting stuck creeperbot " .. unit_number .. " closer to follow target (distance: " .. string.format("%.1f", distance_to_target) .. ")")
+            end
+        end
+        
+        ::continue::
     end
 end
 
@@ -463,6 +648,55 @@ local function evaluate_grouping(event)
     end
 end
 
+-- Process pending water moves (bots that need to move away from water)
+local function process_pending_water_moves(event)
+    if not storage.pending_water_moves then return end
+    
+    for unit_number, move_data in pairs(storage.pending_water_moves) do
+        if event.tick >= move_data.tick then
+            local creeper = storage.creeperbots[unit_number]
+            if creeper and creeper.entity and creeper.entity.valid then
+                local entity = creeper.entity
+                -- Clear any existing destinations and move away
+                entity.autopilot_destination = nil
+                entity.add_autopilot_destination(move_data.position)
+                --game.print("CreeperBot " .. unit_number .. " moving away from water")
+            end
+            storage.pending_water_moves[unit_number] = nil
+        end
+    end
+end
+
+-- Check for bots near water and move them away
+local function check_and_move_bots_away_from_water(event)
+    for unit_number, creeper in pairs(storage.creeperbots or {}) do
+        if not (creeper.entity and creeper.entity.valid) then
+            goto continue
+        end
+        
+        local entity = creeper.entity
+        local position = entity.position
+        local surface = entity.surface
+        
+        -- Only check bots in waking state that are stationary (not moving)
+        if creeper.state == "waking" and entity.speed == 0 then
+            -- Check if bot is on or very close to water
+            if is_position_on_water(surface, position, 2.5) then
+                -- Find a safe position away from water
+                local safe_position = find_safe_position_away_from_water(surface, entity, position, 30)
+                if safe_position then
+                    -- Clear any existing destinations and move away
+                    entity.autopilot_destination = nil
+                    entity.add_autopilot_destination(safe_position)
+                    --game.print("CreeperBot " .. unit_number .. " detected near water, moving away")
+                end
+            end
+        end
+        
+        ::continue::
+    end
+end
+
 -- Combined tick handler (every 60 ticks)
 local function handle_tick_60(event)
     cleanup_invalid_units()
@@ -470,6 +704,8 @@ local function handle_tick_60(event)
     update_creeperbots(event)
     resolve_leader_candidates(event)
     evaluate_grouping(event)
+    check_and_teleport_stuck_bots(event)
+    check_and_move_bots_away_from_water(event)
 end
 
 -- Handle path request completion
@@ -632,6 +868,158 @@ local function handle_selected_entity(event)
     end
 end
 
+-- Update territory visualization for a player (call when map view changes)
+local function update_territory_visualization(player_index)
+    local player = game.get_player(player_index)
+    if not player then return end
+    
+    storage.territory_visualization = storage.territory_visualization or {}
+    local vis_state = storage.territory_visualization[player_index]
+    if not vis_state or not vis_state.enabled then return end
+    
+    -- Clear old renderings
+    for _, render_id in ipairs(vis_state.render_ids) do
+        if type(render_id) == "number" then
+            local render_obj = rendering.get_object_by_id(render_id)
+            if render_obj and render_obj.valid then
+                render_obj.destroy()
+            end
+        elseif type(render_id) == "userdata" then
+            -- It's a render object directly
+            if render_id.valid then
+                render_id.destroy()
+            end
+        end
+    end
+    vis_state.render_ids = {}
+    
+    -- Get player's current surface
+    local surface = player.surface or game.surfaces[1]
+    if not surface or not surface.valid then return end
+    
+    local surface_id = surface.index
+    local territory = storage.territory and storage.territory[surface_id]
+    if not territory then return end
+    
+    -- Determine view center - use player position
+    local center_pos = player.position
+    local view_radius = 25  -- Render chunks within 25 chunks of center (800 tiles)
+    
+    local center_chunk = {
+        x = math.floor(center_pos.x / 32),
+        y = math.floor(center_pos.y / 32)
+    }
+    
+    -- Render chunks in visible area (only safe and unsafe, skip unvisited)
+    local rendered_count = 0
+    for chunk_key, chunk_data in pairs(territory) do
+        -- Only render chunks that have been visited (have safety status)
+        if chunk_data.safe ~= nil then
+            local cx, cy = chunk_key:match("([^,]+),([^,]+)")
+            if cx and cy then
+                cx = tonumber(cx)
+                cy = tonumber(cy)
+                
+                -- Only render chunks within view radius
+                local chunk_distance = math.max(math.abs(cx - center_chunk.x), math.abs(cy - center_chunk.y))
+                if chunk_distance <= view_radius then
+                    local chunk_pos = {x = cx * 32, y = cy * 32}
+                    local chunk_size = 32
+                    
+                    -- Determine color based on chunk status
+                    local color
+                    if chunk_data.safe == true then
+                        color = {r = 0, g = 0.8, b = 0, a = 0.25}  -- Green for safe
+                    elseif chunk_data.safe == false then
+                        color = {r = 0.8, g = 0, b = 0, a = 0.25}  -- Red for unsafe
+                    else
+                        -- Skip unvisited chunks (shouldn't happen due to check above, but just in case)
+                        goto continue
+                    end
+                    
+                    -- Draw rectangle for chunk
+                    local render_obj = rendering.draw_rectangle{
+                        color = color,
+                        filled = true,
+                        left_top = {x = chunk_pos.x, y = chunk_pos.y},
+                        right_bottom = {x = chunk_pos.x + chunk_size, y = chunk_pos.y + chunk_size},
+                        surface = surface,
+                        draw_on_ground = true,
+                        only_in_alt_mode = true  -- Only show in map mode (alt view)
+                    }
+                    
+                    if render_obj then
+                        -- Store the render object (could be userdata or number ID)
+                        table.insert(vis_state.render_ids, render_obj)
+                        rendered_count = rendered_count + 1
+                    end
+                end
+            end
+        end
+        ::continue::
+    end
+    
+    storage.territory_visualization[player_index] = vis_state
+end
+
+-- Toggle territory visualization for a player
+local function toggle_territory_visualization(player_index)
+    local player = game.get_player(player_index)
+    if not player then return end
+    
+    storage.territory_visualization = storage.territory_visualization or {}
+    local vis_state = storage.territory_visualization[player_index] or {enabled = false, render_ids = {}}
+    
+    if vis_state.enabled then
+        -- Disable: Clear all renderings
+        for _, render_id in ipairs(vis_state.render_ids) do
+            if type(render_id) == "number" then
+                local render_obj = rendering.get_object_by_id(render_id)
+                if render_obj and render_obj.valid then
+                    render_obj.destroy()
+                end
+            elseif type(render_id) == "userdata" then
+                -- It's a render object directly
+                if render_id.valid then
+                    render_id.destroy()
+                end
+            end
+        end
+        vis_state.render_ids = {}
+        vis_state.enabled = false
+        player.print("Territory visualization disabled")
+    else
+        -- Enable: Render chunks
+        vis_state.enabled = true
+        vis_state.render_ids = {}
+        update_territory_visualization(player_index)
+        player.print("Territory visualization enabled (press Ctrl+T again to toggle off)")
+    end
+    
+    storage.territory_visualization[player_index] = vis_state
+end
+
+-- Handle keyboard shortcut
+local function handle_territory_toggle(event)
+    toggle_territory_visualization(event.player_index)
+end
+
+-- Update visualization when player moves (for map view updates)
+local function handle_player_changed_position(event)
+    local player = game.get_player(event.player_index)
+    if not player then return end
+    
+    storage.territory_visualization = storage.territory_visualization or {}
+    local vis_state = storage.territory_visualization[event.player_index]
+    if vis_state and vis_state.enabled then
+        -- Update visualization periodically (every 2 seconds) to avoid lag
+        if not vis_state.last_update_tick or (game.tick - vis_state.last_update_tick) > 120 then
+            update_territory_visualization(event.player_index)
+            vis_state.last_update_tick = game.tick
+        end
+    end
+end
+
 -- Register event handlers
 script.on_init(initialize_storage)
 script.on_configuration_changed(initialize_storage)
@@ -639,12 +1027,29 @@ script.on_configuration_changed(initialize_storage)
 script.on_event(defines.events.on_built_entity, handle_entity_creation)
 script.on_event(defines.events.on_robot_built_entity, handle_entity_creation)
 script.on_event(defines.events.script_raised_revive, handle_entity_creation)
+script.on_event(defines.events.on_trigger_created_entity, handle_trigger_created_entity)
 
 script.on_event(defines.events.on_player_mined_entity, cleanup_creeperbot)
 script.on_event(defines.events.on_entity_died, handle_entity_death)
 
 script.on_event(defines.events.on_selected_entity_changed, handle_selected_entity)
 
+-- Register custom input for territory visualization toggle
+script.on_event("creeperbots-toggle-territory", handle_territory_toggle)
+
+-- Update visualization periodically (every 2 seconds) for all connected players
+script.on_nth_tick(120, function(event)  -- Every 2 seconds
+    for player_index, _ in pairs(game.connected_players) do
+        handle_player_changed_position({player_index = player_index})
+    end
+end)
+
+-- Cleanup old territory data periodically (every 10 minutes)
+script.on_nth_tick(36000, function()
+    cleanup_old_territory_data(36000)  -- Remove chunks not checked in 10 minutes
+end)
+
+script.on_nth_tick(1, process_pending_water_moves)  -- Check every tick for pending water moves
 script.on_nth_tick(15, process_autopilot_queue) 
 script.on_nth_tick(30, process_creeperbots)
 script.on_nth_tick(60, handle_tick_60)

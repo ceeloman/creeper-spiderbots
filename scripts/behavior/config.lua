@@ -9,7 +9,7 @@ local config = {}
 config.tier_configs = {
     ["creeperbot-mk1"] = { tier = 1, damage = 200, radius = 3.5, max_targeting = 3, explosion = "big-explosion" },
     ["creeperbot-mk2"] = { tier = 2, damage = 400, radius = 5.0, max_targeting = 2, explosion = "massive-explosion" },
-    ["creeperbot-mk3-nuclear"] = { tier = 3, damage = 900, radius = 20, max_targeting = 1, explosion = "nuke-explosion", extra_effect = "nuclear-smoke" },
+    ["creeperbot-mk3-nuclear"] = { tier = 3, damage = 900, radius = 20, max_targeting = 1, explosion = "nuke-explosion"},
 }
 
 function config.get_creeperbot_tier(entity_name)

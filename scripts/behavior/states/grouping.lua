@@ -189,7 +189,8 @@ function grouping_state.handle_grouping_state(creeper, event, position, entity, 
                 last_join_tick = event.tick,
                 state = "grouping",
                 follower_targets = {},
-                visited_chunks = {}
+                visited_chunks = {},
+                surface = entity.surface  -- Store surface reference for territory tracking
             }
             storage.parties[party_id] = party
             creeper.party_id = party_id

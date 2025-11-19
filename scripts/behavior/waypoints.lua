@@ -264,9 +264,23 @@ function waypoints.process_waypoints(creeper)
         if distance <= threshold and (creeper.last_waypoint_change or 0) + 20 < game.tick then
            -- game.print("Debug: Leader " .. creeper.unit_number .. " reached waypoint at (" .. current_destination.x .. "," .. current_destination.y .. ") on tick " .. game.tick)
             
+            -- Mark chunks within view distance (3 chunks) when waypoint is reached
+            if creeper.is_leader and party then
+                local current_chunk_pos = get_chunk_pos(current_destination)
+                -- Mark chunks in view distance, but don't set safety yet (wait for enemy scan)
+                mark_chunks_in_view(surface, current_chunk_pos.x, current_chunk_pos.y, nil, game.tick, 3)
+            end
+            
            -- game.print("Debug: Scanning for enemies for unit " .. creeper.unit_number .. ", tick: " .. game.tick)
             local target, target_type = behavior_utils.scan_for_enemies(position, surface, config.tier_configs[entity.name].max_targeting)
             if target and (target_type == "unit" or target_type == "nest") then
+                -- Mark chunks within view distance as unsafe when enemies are detected
+                if creeper.is_leader and party then
+                    local current_chunk_pos = get_chunk_pos(current_destination)
+                    mark_chunks_in_view(surface, current_chunk_pos.x, current_chunk_pos.y, false, game.tick, 3)
+                    --game.print("Debug: Chunks within 3 chunks of (" .. current_chunk_pos.x .. "," .. current_chunk_pos.y .. ") marked as unsafe due to enemy detection")
+                end
+                
                 --game.print("Debug: Leader " .. creeper.unit_number .. " detected " .. target_type .. " at (" .. target.position.x .. "," .. target.position.y .. "), transitioning party to preparing_to_attack, tick: " .. game.tick)
                 for unit_number, member in pairs(storage.creeperbots or {}) do
                     if member.party_id == creeper.party_id and member.entity and member.entity.valid then
@@ -284,6 +298,12 @@ function waypoints.process_waypoints(creeper)
                 end
                 return false
             else
+                -- No enemies detected - mark chunks within view distance as safe
+                if creeper.is_leader and party then
+                    local current_chunk_pos = get_chunk_pos(current_destination)
+                    mark_chunks_in_view(surface, current_chunk_pos.x, current_chunk_pos.y, true, game.tick, 3)
+                    --game.print("Debug: Chunks within 3 chunks of (" .. current_chunk_pos.x .. "," .. current_chunk_pos.y .. ") marked as safe (no enemies)")
+                end
                 --game.print("Debug: No enemies detected by unit " .. creeper.unit_number .. ", target_type: " .. (target_type or "none") .. ", target: " .. (target and "valid" or "nil") .. ", tick: " .. game.tick)
             end
             

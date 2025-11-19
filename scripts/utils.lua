@@ -3,6 +3,94 @@
 function calculate_distance(pos1, pos2)
     return ((pos1.x - pos2.x)^2 + (pos1.y - pos2.y)^2)^0.5
 end
+
+-- Check if a position is on or near water
+function is_position_on_water(surface, position, check_radius)
+    check_radius = check_radius or 1.5  -- Default: check 1.5 tiles radius
+    
+    -- Check the center tile
+    local tile = surface.get_tile(math.floor(position.x), math.floor(position.y))
+    if tile and tile.valid then
+        local tile_name = tile.name:lower()
+        if tile_name:find("water") or tile_name:find("lava") or tile_name:find("lake") or tile_name:find("ammoniacal") then
+            return true
+        end
+    end
+    
+    -- Check surrounding tiles within radius
+    for dx = -math.ceil(check_radius), math.ceil(check_radius) do
+        for dy = -math.ceil(check_radius), math.ceil(check_radius) do
+            local dist = math.sqrt(dx^2 + dy^2)
+            if dist <= check_radius then
+                local check_pos = {x = math.floor(position.x + dx), y = math.floor(position.y + dy)}
+                local check_tile = surface.get_tile(check_pos.x, check_pos.y)
+                if check_tile and check_tile.valid then
+                    local tile_name = check_tile.name:lower()
+                    if tile_name:find("water") or tile_name:find("lava") or tile_name:find("lake") or tile_name:find("ammoniacal") then
+                        return true
+                    end
+                end
+            end
+        end
+    end
+    
+    return false
+end
+
+-- Find a safe position away from water, starting near the given position
+function find_safe_position_away_from_water(surface, entity, start_position, max_search_radius)
+    max_search_radius = max_search_radius or 20  -- Default: search up to 20 tiles away
+    
+    -- First, try to find a non-colliding position using the game's built-in function
+    if surface.find_non_colliding_position then
+        local safe_pos = surface.find_non_colliding_position(entity.name, start_position, max_search_radius, 0.5)
+        if safe_pos then
+            -- Verify it's not on water
+            if not is_position_on_water(surface, safe_pos, 1.5) then
+                return safe_pos
+            end
+        end
+    end
+    
+    -- Fallback: Search in expanding circles for a safe position
+    local random = game.create_random_generator()
+    for radius = 2, max_search_radius, 2 do
+        -- Try multiple random positions at this radius
+        for attempt = 1, 8 do
+            local angle = random(0, 360)
+            local test_pos = {
+                x = start_position.x + math.cos(math.rad(angle)) * radius,
+                y = start_position.y + math.sin(math.rad(angle)) * radius
+            }
+            
+            -- Check if this position is safe (not on water and can place entity)
+            if not is_position_on_water(surface, test_pos, 1.5) then
+                if surface.find_non_colliding_position then
+                    local safe_pos = surface.find_non_colliding_position(entity.name, test_pos, 2, 0.5)
+                    if safe_pos and not is_position_on_water(surface, safe_pos, 1.5) then
+                        return safe_pos
+                    end
+                else
+                    -- Fallback: just return the position if it's not on water
+                    return test_pos
+                end
+            end
+        end
+    end
+    
+    -- If we couldn't find a safe position, return nil
+    return nil
+end
+
+-- Get a random position within a radius of the given position
+-- Uses a distribution that favors positions closer to the center
+function get_random_position_in_radius(position, radius)
+    local angle = math.random() * 2 * math.pi
+    local length = radius * math.random() ^ 0.25
+    local x = position.x + length * math.cos(angle)
+    local y = position.y + length * math.sin(angle)
+    return { x = x, y = y }
+end
   
   -- Get chunk position from tile position
 function get_chunk_pos(position)
@@ -169,6 +257,10 @@ function process_autopilot_queue(event)
             
             -- Process the next destination if found
             if next_dest then
+                -- Re-validate entity before accessing (could have become invalid)
+                if not (creeper and creeper.entity and creeper.entity.valid) then
+                    storage.autopilot_queue[unit_number] = nil
+                else
                 -- If bot has a current destination, don't override it yet
                 if not creeper.entity.autopilot_destination then
                     -- Apply the autopilot destination
@@ -177,9 +269,14 @@ function process_autopilot_queue(event)
                     
                     -- Handle enemy scanning if requested
                     if next_dest.should_scan then
+                        -- Re-validate entity before accessing (could have become invalid)
+                        if not (creeper and creeper.entity and creeper.entity.valid) then
+                            storage.autopilot_queue[unit_number] = nil
+                            return
+                        end
                         local position = creeper.entity.position
                         local surface = creeper.entity.surface
-                        local max_targeting = tier_configs[creeper.entity.name] and tier_configs[creeper.entity.name].max_targeting or 3
+                        local max_targeting = (tier_configs and tier_configs[creeper.entity.name] and tier_configs[creeper.entity.name].max_targeting) or 3
                         --game.print("Debug: Scanning for enemies, unit_number: " .. unit_number .. ", entity.name: " .. tostring(creeper.entity.name) .. ", max_targeting: " .. max_targeting)
                         local target = scan_for_enemies(position, surface, max_targeting, creeper.state == "waking")
                         
@@ -188,19 +285,38 @@ function process_autopilot_queue(event)
                             -- State transition removed - to be reimplemented
                             -- creeper.state = "approaching"
                             creeper.target = target
-                            storage.parties[creeper.party_id].shared_target = target
+                            
+                            -- Safely access party data
+                            if storage.parties and creeper.party_id and storage.parties[creeper.party_id] then
+                                storage.parties[creeper.party_id].shared_target = target
+                            end
+                            
+                            -- Re-validate entity before accessing (could have become invalid)
+                            if not (creeper and creeper.entity and creeper.entity.valid) then
+                                storage.autopilot_queue[unit_number] = nil
+                                return
+                            end
+                            
                             creeper.entity.color = {r = 1, g = 0, b = 0}
                             clear_renderings(creeper)
                             creeper.entity.autopilot_destination = nil
                             
                             local chunk_pos = get_chunk_pos(target.position)
-                            if not has_pending_path_requests(storage.parties[creeper.party_id], chunk_pos.x, chunk_pos.y) then
-                                mark_pending_path_requests(storage.parties[creeper.party_id], chunk_pos.x, chunk_pos.y)
-                                request_multiple_paths(position, target.position, storage.parties[creeper.party_id], surface, unit_number)
+                            if storage.parties and creeper.party_id and storage.parties[creeper.party_id] then
+                                if not has_pending_path_requests(storage.parties[creeper.party_id], chunk_pos.x, chunk_pos.y) then
+                                    mark_pending_path_requests(storage.parties[creeper.party_id], chunk_pos.x, chunk_pos.y)
+                                    request_multiple_paths(position, target.position, storage.parties[creeper.party_id], surface, unit_number)
+                                end
                             end
                             
                             -- Cancel any existing queue for this bot
                             storage.autopilot_queue[unit_number] = nil
+                            
+                            -- Re-validate entity before accessing (could have become invalid)
+                            if not (creeper and creeper.entity and creeper.entity.valid) then
+                                storage.autopilot_queue[unit_number] = nil
+                                return
+                            end
                             
                             -- Add new destination toward enemy
                             creeper.entity.add_autopilot_destination(target.position)
@@ -220,6 +336,10 @@ function process_autopilot_queue(event)
                     
                     -- If the queue is now empty and we've completed the last move without finding enemies
                     if #queue == 0 and creeper.state == "waking" then
+                        -- Re-validate entity before accessing (could have become invalid)
+                        if not (creeper and creeper.entity and creeper.entity.valid) then
+                            storage.autopilot_queue[unit_number] = nil
+                        else
                         --game.print("CreeperBot " .. unit_number .. " completed waking, switching to grouping")
                         creeper.state = "grouping"
                         creeper.entity.color = {r = 0.5, g = 0.5, b = 0.5}
@@ -234,8 +354,10 @@ function process_autopilot_queue(event)
                         
                         -- Reset grouping_initialized so bot properly joins/creates party with fresh timer
                         creeper.grouping_initialized = false
+                        end  -- Close the else block for entity validation
                     end
                 end
+                end  -- Close the else block for entity validation
             end
         end
     end
@@ -371,49 +493,306 @@ function request_multiple_paths(position, target_pos, party, surface, creeper_un
     end
     return false
 end
+
+-- Get chunk territory data for a surface
+function get_territory_for_surface(surface)
+    if not surface or not surface.valid then
+        return nil
+    end
+    local surface_id = surface.index
+    storage.territory = storage.territory or {}
+    storage.territory[surface_id] = storage.territory[surface_id] or {}
+    return storage.territory[surface_id]
+end
+
+-- Get chunk data (safe status, visits, last checked)
+function get_chunk_data(surface, chunk_x, chunk_y)
+    local territory = get_territory_for_surface(surface)
+    if not territory then return nil end
+    
+    local chunk_key = chunk_x .. "," .. chunk_y
+    return territory[chunk_key] or {safe = nil, visits = 0, last_checked = 0}
+end
+
+-- Mark chunk as visited and optionally safe/unsafe
+function mark_chunk_visited(surface, chunk_x, chunk_y, is_safe, tick)
+    local territory = get_territory_for_surface(surface)
+    if not territory then return end
+    
+    local chunk_key = chunk_x .. "," .. chunk_y
+    local chunk_data = territory[chunk_key] or {safe = nil, visits = 0, last_checked = 0}
+    
+    chunk_data.visits = chunk_data.visits + 1
+    chunk_data.last_checked = tick or game.tick
+    
+    if is_safe ~= nil then
+        chunk_data.safe = is_safe
+    end
+    
+    territory[chunk_key] = chunk_data
+end
+
+-- Mark chunk as safe or unsafe
+function mark_chunk_safety(surface, chunk_x, chunk_y, is_safe, tick)
+    local territory = get_territory_for_surface(surface)
+    if not territory then return end
+    
+    local chunk_key = chunk_x .. "," .. chunk_y
+    local chunk_data = territory[chunk_key] or {safe = nil, visits = 0, last_checked = 0}
+    
+    chunk_data.safe = is_safe
+    chunk_data.last_checked = tick or game.tick
+    
+    territory[chunk_key] = chunk_data
+end
+
+-- Mark chunks within view distance (3 chunks) of a visited chunk
+-- This represents the bot's view distance - when a bot visits a chunk, it can see up to 3 chunks away
+function mark_chunks_in_view(surface, center_chunk_x, center_chunk_y, is_safe, tick, view_distance)
+    view_distance = view_distance or 3  -- Default 3 chunks view distance
+    local territory = get_territory_for_surface(surface)
+    if not territory then return end
+    
+    -- Mark all chunks within view distance
+    for dx = -view_distance, view_distance do
+        for dy = -view_distance, view_distance do
+            local chunk_distance = math.max(math.abs(dx), math.abs(dy))  -- Chebyshev distance
+            if chunk_distance <= view_distance then
+                local cx = center_chunk_x + dx
+                local cy = center_chunk_y + dy
+                local chunk_key = cx .. "," .. cy
+                
+                -- Only mark if chunk is generated
+                if surface.is_chunk_generated({x = cx, y = cy}) then
+                    local chunk_data = territory[chunk_key] or {safe = nil, visits = 0, last_checked = 0}
+                    
+                    -- Increment visits for the center chunk, but mark all chunks in view
+                    if dx == 0 and dy == 0 then
+                        chunk_data.visits = chunk_data.visits + 1
+                    end
+                    
+                    -- Mark safety status if provided
+                    if is_safe ~= nil then
+                        chunk_data.safe = is_safe
+                    end
+                    
+                    chunk_data.last_checked = tick or game.tick
+                    territory[chunk_key] = chunk_data
+                end
+            end
+        end
+    end
+end
+
+-- Optional: Cleanup old chunk data (chunks not checked in X ticks)
+-- Call this periodically (e.g., every 10 minutes) to prevent memory bloat
+function cleanup_old_territory_data(max_age_ticks)
+    max_age_ticks = max_age_ticks or 36000  -- Default: 10 minutes (600 seconds * 60 ticks/sec)
+    local current_tick = game.tick
+    
+    storage.territory = storage.territory or {}
+    
+    for surface_id, territory in pairs(storage.territory) do
+        local surface = game.surfaces[surface_id]
+        -- Only cleanup if surface still exists
+        if surface and surface.valid then
+            local to_remove = {}
+            for chunk_key, chunk_data in pairs(territory) do
+                -- Remove chunks that haven't been checked in a long time
+                -- Keep chunks that were recently checked or have high visit counts (important areas)
+                if chunk_data.last_checked > 0 and 
+                   (current_tick - chunk_data.last_checked) > max_age_ticks and
+                   chunk_data.visits < 3 then  -- Keep frequently visited chunks
+                    table.insert(to_remove, chunk_key)
+                end
+            end
+            for _, key in ipairs(to_remove) do
+                territory[key] = nil
+            end
+        else
+            -- Surface no longer exists, remove its territory data
+            storage.territory[surface_id] = nil
+        end
+    end
+end
   
 function get_unvisited_chunk(position, party)
-    local surface = game.surfaces[1]
+    local surface = party and party.surface or game.surfaces[1]
+    if not surface or not surface.valid then
+        return {x = position.x, y = position.y}
+    end
+    
     local chunk_pos = get_chunk_pos(position)
-    party.visited_chunks = party.visited_chunks or {}
-
-    local search_radius = 10 -- Increased from 5
-    local valid_chunks = {}
-
+    local territory = get_territory_for_surface(surface)
+    
+    -- Target chunks 3-5 chunks away (insect-like scouting behavior)
+    local min_distance = 3
+    local max_distance = 5
+    local search_radius = 10  -- Maximum search radius if no chunks found in preferred range
+    
+    local unclaimed_chunks = {}  -- Unvisited chunks
+    local safe_claimed_chunks = {}  -- Visited but safe chunks
+    
+    -- First pass: Find chunks in preferred distance range (3-5 chunks away)
     for dx = -search_radius, search_radius do
         for dy = -search_radius, search_radius do
             local cx, cy = chunk_pos.x + dx, chunk_pos.y + dy
-            local chunk_key = cx .. "," .. cy
-            local visit_count = party.visited_chunks[chunk_key] or 0
-            if surface.is_chunk_generated({x = cx, y = cy}) then
-                local test_pos = {x = (cx * 32) + 16, y = (cy * 32) + 16}
-                local tile = surface.get_tile(test_pos.x, test_pos.y)
-                local tile_name = tile.name:lower()
+            local chunk_distance = math.max(math.abs(dx), math.abs(dy))  -- Chebyshev distance
+            
+            -- Only consider chunks in preferred range first
+            if chunk_distance >= min_distance and chunk_distance <= max_distance then
+                local chunk_key = cx .. "," .. cy
+                local chunk_data = territory[chunk_key] or {safe = nil, visits = 0, last_checked = 0}
                 
-                if not (tile_name:find("water") or tile_name:find("lava") or tile_name:find("lake") or tile_name:find("ammoniacal")) then
-                    local valid_pos = surface.find_non_colliding_position("character", test_pos, 10, 2)
-                    if valid_pos then
-                        local dist = math.sqrt((valid_pos.x - position.x)^2 + (valid_pos.y - position.y)^2)
-                        if dist >= 50 then -- Minimum distance 50 tiles
-                            table.insert(valid_chunks, {
-                                x = cx,
-                                y = cy,
-                                pos = valid_pos,
-                                visits = visit_count
-                            })
+                if surface.is_chunk_generated({x = cx, y = cy}) then
+                    -- Check multiple points in the chunk to verify accessibility
+                    local chunk_accessible = false
+                    local valid_pos = nil
+                    
+                    -- Sample 4 corners and center of chunk to check accessibility
+                    local test_points = {
+                        {x = (cx * 32) + 8, y = (cy * 32) + 8},   -- NW corner
+                        {x = (cx * 32) + 24, y = (cy * 32) + 8},  -- NE corner
+                        {x = (cx * 32) + 8, y = (cy * 32) + 24}, -- SW corner
+                        {x = (cx * 32) + 24, y = (cy * 32) + 24}, -- SE corner
+                        {x = (cx * 32) + 16, y = (cy * 32) + 16}  -- Center
+                    }
+                    
+                    for _, test_pos in ipairs(test_points) do
+                        local tile = surface.get_tile(test_pos.x, test_pos.y)
+                        local tile_name = tile.name:lower()
+                        
+                        -- Skip water/lava tiles
+                        if not (tile_name:find("water") or tile_name:find("lava") or tile_name:find("lake") or tile_name:find("ammoniacal")) then
+                            local found_pos = surface.find_non_colliding_position("character", test_pos, 10, 2)
+                            if found_pos then
+                                chunk_accessible = true
+                                if not valid_pos then
+                                    valid_pos = found_pos
+                                end
+                            end
+                        end
+                    end
+                    
+                    -- Additional check: verify chunk is not an island by checking if it connects to adjacent chunks
+                    if chunk_accessible and valid_pos then
+                        -- Check if at least one adjacent chunk (N, S, E, W) is also accessible
+                        local adjacent_accessible = false
+                        local adjacent_dirs = {{x = 0, y = -1}, {x = 0, y = 1}, {x = 1, y = 0}, {x = -1, y = 0}}
+                        for _, dir in ipairs(adjacent_dirs) do
+                            local adj_cx, adj_cy = cx + dir.x, cy + dir.y
+                            if surface.is_chunk_generated({x = adj_cx, y = adj_cy}) then
+                                local adj_test_pos = {x = (adj_cx * 32) + 16, y = (adj_cy * 32) + 16}
+                                local adj_tile = surface.get_tile(adj_test_pos.x, adj_test_pos.y)
+                                local adj_tile_name = adj_tile.name:lower()
+                                if not (adj_tile_name:find("water") or adj_tile_name:find("lava") or adj_tile_name:find("lake") or adj_tile_name:find("ammoniacal")) then
+                                    local adj_valid = surface.find_non_colliding_position("character", adj_test_pos, 10, 2)
+                                    if adj_valid then
+                                        adjacent_accessible = true
+                                        break
+                                    end
+                                end
+                            end
+                        end
+                        
+                        -- Only include chunk if it's accessible and has at least one accessible neighbor (not an island)
+                        if adjacent_accessible then
+                            local dist = math.sqrt((valid_pos.x - position.x)^2 + (valid_pos.y - position.y)^2)
+                            if dist >= 50 then -- Minimum distance 50 tiles
+                                if chunk_data.visits == 0 then
+                                    -- Unclaimed chunk
+                                    table.insert(unclaimed_chunks, {
+                                        x = cx,
+                                        y = cy,
+                                        pos = valid_pos,
+                                        visits = chunk_data.visits,
+                                        distance = chunk_distance
+                                    })
+                                elseif chunk_data.safe == true then
+                                    -- Safe claimed chunk (for rechecking)
+                                    table.insert(safe_claimed_chunks, {
+                                        x = cx,
+                                        y = cy,
+                                        pos = valid_pos,
+                                        visits = chunk_data.visits,
+                                        distance = chunk_distance
+                                    })
+                                end
+                            end
                         end
                     end
                 end
             end
         end
     end
-
-    table.sort(valid_chunks, function(a, b) return a.visits < b.visits end)
-
-    if #valid_chunks > 0 then
-        local chunk = valid_chunks[1]
-        --request_multiple_paths(position, chunk.pos, party, surface, party.grouping_leader)
-        return chunk.pos
+    
+    -- Prefer unclaimed chunks, but if all chunks are claimed and safe, recheck safe chunks
+    local candidates = {}
+    if #unclaimed_chunks > 0 then
+        candidates = unclaimed_chunks
+    elseif #safe_claimed_chunks > 0 then
+        candidates = safe_claimed_chunks
+    end
+    
+    -- If no chunks found in preferred range, expand search (but still prefer unclaimed)
+    if #candidates == 0 then
+        for dx = -search_radius, search_radius do
+            for dy = -search_radius, search_radius do
+                local cx, cy = chunk_pos.x + dx, chunk_pos.y + dy
+                local chunk_distance = math.max(math.abs(dx), math.abs(dy))
+                
+                -- Skip chunks too close (less than min_distance)
+                if chunk_distance >= min_distance then
+                    local chunk_key = cx .. "," .. cy
+                    local chunk_data = territory[chunk_key] or {safe = nil, visits = 0, last_checked = 0}
+                    
+                    if surface.is_chunk_generated({x = cx, y = cy}) then
+                        local test_pos = {x = (cx * 32) + 16, y = (cy * 32) + 16}
+                        local tile = surface.get_tile(test_pos.x, test_pos.y)
+                        local tile_name = tile.name:lower()
+                        
+                        if not (tile_name:find("water") or tile_name:find("lava") or tile_name:find("lake") or tile_name:find("ammoniacal")) then
+                            local valid_pos = surface.find_non_colliding_position("character", test_pos, 10, 2)
+                            if valid_pos then
+                                local dist = math.sqrt((valid_pos.x - position.x)^2 + (valid_pos.y - position.y)^2)
+                                if dist >= 50 then
+                                    if chunk_data.visits == 0 then
+                                        table.insert(unclaimed_chunks, {
+                                            x = cx,
+                                            y = cy,
+                                            pos = valid_pos,
+                                            visits = chunk_data.visits,
+                                            distance = chunk_distance
+                                        })
+                                    elseif chunk_data.safe == true then
+                                        table.insert(safe_claimed_chunks, {
+                                            x = cx,
+                                            y = cy,
+                                            pos = valid_pos,
+                                            visits = chunk_data.visits,
+                                            distance = chunk_distance
+                                        })
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+        
+        if #unclaimed_chunks > 0 then
+            candidates = unclaimed_chunks
+        elseif #safe_claimed_chunks > 0 then
+            candidates = safe_claimed_chunks
+        end
+    end
+    
+    -- Randomly select from candidates
+    if #candidates > 0 then
+        local random = game.create_random_generator(game.tick + (party and party.id and #tostring(party.id) or 0))
+        local selected = candidates[random(1, #candidates)]
+        return selected.pos
     end
 
     return {x = position.x, y = position.y}

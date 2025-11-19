@@ -3,6 +3,9 @@
 -- Extension mod based on SpiderBots © 2023-2025 by asher_sky (licensed under CC BY-NC-SA 4.0)
 -- This derivative work is also licensed under CC BY-NC-SA 4.0
 
+-- Ensure utils are loaded (functions are global)
+require "scripts.utils"
+
 -- Check if an entity is a Creeperbot
 function is_creeperbot(entity_name)
     return entity_name == "creeperbot-mk1" or
@@ -16,6 +19,36 @@ function register_creeperbot(entity)
     if not storage.parties then storage.parties = {} end
 
     --game.print("CreeperBot " .. entity.name .. " deployed and waking")
+
+    -- Check if the bot is placed on or near water, and move it away if needed
+    if entity.valid and entity.surface and entity.surface.valid then
+        local position = entity.position
+        -- Check a larger radius to catch bots placed very close to water
+        local on_water = is_position_on_water(entity.surface, position, 2.5)
+        if on_water then
+            -- Find a safe position away from water
+            local safe_position = find_safe_position_away_from_water(entity.surface, entity, position, 30)
+            if safe_position then
+                -- Store the safe position to move to after a short delay (next tick)
+                -- This ensures the entity is fully initialized before we try to move it
+                if not storage.pending_water_moves then
+                    storage.pending_water_moves = {}
+                end
+                storage.pending_water_moves[entity.unit_number] = {
+                    position = safe_position,
+                    tick = game.tick + 1  -- Move on next tick
+                }
+                game.print("CreeperBot " .. entity.unit_number .. " detected near water, will move to (" .. string.format("%.1f", safe_position.x) .. ", " .. string.format("%.1f", safe_position.y) .. ")")
+            else
+                -- If we can't find a safe position, try teleport as fallback
+                local fallback_pos = entity.surface.find_non_colliding_position("character", position, 30, 0.5)
+                if fallback_pos and not is_position_on_water(entity.surface, fallback_pos, 2.5) then
+                    entity.teleport(fallback_pos)
+                    game.print("CreeperBot " .. entity.unit_number .. " teleported away from water (fallback)")
+                end
+            end
+        end
+    end
 
     -- Set entity label to unit number
     entity.entity_label = tostring(entity.unit_number)

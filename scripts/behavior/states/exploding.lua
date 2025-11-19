@@ -75,21 +75,21 @@ function exploding_state.handle_exploding_state(creeper, event, position, entity
         local search_radius = 30
         local new_target = nil
         
-        -- First: Look for nearby nests
-        local nests = surface.find_entities_filtered({
-            type = "unit-spawner",
+        -- Priority 1: Look for turrets and nests first (biggest threats)
+        local high_priority_targets = surface.find_entities_filtered({
+            type = {"turret", "unit-spawner"},
             position = position,
             radius = search_radius,
             force = "enemy"
         })
-        for _, nest in ipairs(nests) do
-            if nest.valid and nest.health > 0 then
-                new_target = nest
+        for _, target in ipairs(high_priority_targets) do
+            if target.valid and target.health > 0 then
+                new_target = target
                 break
             end
         end
         
-        -- If no nests found, check for enemy units
+        -- Priority 2: If no turrets/nests found, check for enemy units
         if not new_target then
             local enemy_units = surface.find_entities_filtered({
                 type = "unit",
@@ -122,19 +122,21 @@ function exploding_state.handle_exploding_state(creeper, event, position, entity
         -- If still no target found, expand search to 50 tiles
         if not new_target then
             search_radius = 50
-            nests = surface.find_entities_filtered({
-                type = "unit-spawner",
+            -- Priority 1: Look for turrets and nests first (biggest threats)
+            high_priority_targets = surface.find_entities_filtered({
+                type = {"turret", "unit-spawner"},
                 position = position,
                 radius = search_radius,
                 force = "enemy"
             })
-            for _, nest in ipairs(nests) do
-                if nest.valid and nest.health > 0 then
-                    new_target = nest
+            for _, target in ipairs(high_priority_targets) do
+                if target.valid and target.health > 0 then
+                    new_target = target
                     break
                 end
             end
             
+            -- Priority 2: If no turrets/nests found, check for enemy units
             if not new_target then
                 local enemy_units = surface.find_entities_filtered({
                     type = "unit",
@@ -270,12 +272,13 @@ function exploding_state.handle_exploding_state(creeper, event, position, entity
     
     -- Explosion distance depends on target type:
     -- Nests have large radius, bots can't get to center - use 5 tiles
-    -- Units are smaller - use 2 tiles
+    -- Turrets and units are smaller - use 2 tiles
     local explosion_distance = 5  -- Default for nests
     if creeper.target and creeper.target.valid then
-        if creeper.target.type == "unit" then
-            explosion_distance = 2  -- Units need to be closer
+        if creeper.target.type == "unit" or creeper.target.type == "turret" then
+            explosion_distance = 2  -- Units and turrets need to be closer
         end
+        -- Nests use default 5 tiles
     end
 
     -- Close enough to explode
@@ -290,7 +293,7 @@ function exploding_state.handle_exploding_state(creeper, event, position, entity
             end
             -- Create additional atomic explosions
             for _ = 1, 3 do
-                surface.create_entity({name = "atomic-explosion", position = position})
+                surface.create_entity({name = "nuke-effects-nauvis", position = position})
             end
             -- Create extra effect if specified
             if tier.extra_effect then

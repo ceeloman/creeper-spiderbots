@@ -52,7 +52,7 @@ local creeperbot_configs = {
         leg_thickness = 1.4,
         leg_movement_speed = 1.1,
         health = 400,
-        explosion = "atomic-rocket",
+        explosion = "nuke-explosion",
         damage = 500,
         explosion_radius = 8.0,
         recipe_ingredients = {
@@ -89,6 +89,45 @@ for _, config in pairs(creeperbot_configs) do
         prototype.allow_passengers = false
         prototype.is_military_target = true
         prototype.se_allow_in_space = false
+        
+        -- Add resistances to turret attacks (physical, fire, laser, electric)
+        -- Higher tiers get better resistances
+        local resistance_percent = config.name == "creeperbot-mk3-nuclear" and 75 or 
+                                   config.name == "creeperbot-mk2" and 60 or 50
+        prototype.resistances = {
+            {
+                type = "physical",
+                decrease = 0,
+                percent = resistance_percent
+            },
+            {
+                type = "fire",
+                decrease = 0,
+                percent = resistance_percent
+            },
+            {
+                type = "laser",
+                decrease = 0,
+                percent = resistance_percent
+            },
+            {
+                type = "electric",
+                decrease = 0,
+                percent = resistance_percent
+            },
+            {
+                type = "explosion",
+                decrease = 0,
+                percent = resistance_percent * 0.5  -- Half resistance to explosions
+            }
+        }
+        
+        -- Remove corpse (bots self-destruct, nothing left)
+        prototype.corpse = nil
+        prototype.create_ghost_on_death = false
+        
+        -- Remove logistic capabilities
+        prototype.trash_slots = 0
 
         -- Speed and movement adjustments
         prototype.torso_rotation_speed = prototype.torso_rotation_speed * 2.0

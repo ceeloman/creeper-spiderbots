@@ -228,6 +228,12 @@ function process_autopilot_queue(event)
                         if creeper.waking_initialized then
                             creeper.waking_initialized = nil
                         end
+                        if creeper.waking_start_tick then
+                            creeper.waking_start_tick = nil
+                        end
+                        
+                        -- Reset grouping_initialized so bot properly joins/creates party with fresh timer
+                        creeper.grouping_initialized = false
                     end
                 end
             end

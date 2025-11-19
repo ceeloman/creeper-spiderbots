@@ -48,5 +48,26 @@ function clear_renderings(creeper)
         
         creeper.dynamic_line_id = nil
     end
+    
+    -- Clear debug text
+    if creeper.debug_text_id then
+        if type(creeper.debug_text_id) == "userdata" then
+            -- It's a rendering object directly
+            if creeper.debug_text_id.valid then
+                creeper.debug_text_id.destroy()
+            end
+        elseif type(creeper.debug_text_id) == "number" then
+            -- It's a numeric ID
+            local debug_text = rendering.get_object_by_id(creeper.debug_text_id)
+            if debug_text and debug_text.valid then
+                debug_text.destroy()
+            end
+        end
+        creeper.debug_text_id = nil
+    end
 end
 
+local rendering_module = {}
+rendering_module.clear_renderings = clear_renderings
+
+return rendering_module

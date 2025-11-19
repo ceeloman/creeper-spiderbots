@@ -19,6 +19,70 @@ function scouting_state.handle_scouting_state(creeper, event, position, entity, 
         --game.print("Error: Invalid surface for unit " .. (creeper.unit_number or "unknown"))
         return
     end
+    
+    -- Check if bot is being attacked by bugs - if so, explode immediately
+    local is_being_attacked = false
+    
+    -- Method 1: Track health changes (only trigger on significant damage, > 1% or 5 health)
+    if not creeper.last_health then
+        creeper.last_health = entity.health
+    end
+    -- Track initial/max health when first seen
+    if not creeper.max_health then
+        creeper.max_health = entity.health
+    end
+    -- Update max_health if current health exceeds it (healing/repair)
+    if entity.health > creeper.max_health then
+        creeper.max_health = entity.health
+    end
+    local health_loss = creeper.last_health - entity.health
+    local health_threshold = math.max(5, creeper.max_health * 0.01)  -- 1% of max health or 5, whichever is larger
+    if health_loss > health_threshold then
+        is_being_attacked = true
+    end
+    creeper.last_health = entity.health
+    
+    -- Method 2: Check for very close enemies (within 3 tiles) that are actually attacking
+    -- Only check if we haven't already detected an attack via health loss
+    if not is_being_attacked then
+        local nearby_enemies = surface.find_entities_filtered({
+            type = "unit",
+            position = position,
+            radius = 3,  -- Reduced from 5 to 3 - only very close enemies
+            force = "enemy"
+        })
+        -- Check if any enemy is actually moving toward us or very close
+        for _, enemy in ipairs(nearby_enemies) do
+            if enemy.valid then
+                local dist = calculate_distance(position, enemy.position)
+                if dist <= 2.5 then  -- Very close, likely attacking
+                    is_being_attacked = true
+                    break
+                end
+            end
+        end
+    end
+    
+    -- If being attacked, transition to exploding
+    if is_being_attacked then
+        -- Find nearest enemy as target
+        local nearby_enemies = surface.find_entities_filtered({
+            type = "unit",
+            position = position,
+            radius = 10,
+            force = "enemy"
+        })
+        if #nearby_enemies > 0 and nearby_enemies[1].valid then
+            creeper.target = nearby_enemies[1]
+            creeper.target_position = nearby_enemies[1].position
+        else
+            creeper.target = nil
+            creeper.target_position = position
+        end
+        creeper.state = "exploding"
+        update_color(entity, "exploding")
+        return
+    end
     --game.print("Debug: handle_scouting_state for unit " .. creeper.unit_number .. ", party: " .. (creeper.party_id or "none") .. ", surface: " .. surface.name)
 
     local members = {}
@@ -56,6 +120,38 @@ function scouting_state.handle_scouting_state(creeper, event, position, entity, 
             return
         end
         leader = new_leader
+    end
+    
+    -- Show debug message above leader's head
+    if creeper.is_leader and entity.valid then
+        -- Clear old debug text
+        if creeper.debug_text_id then
+            if type(creeper.debug_text_id) == "userdata" then
+                -- It's a rendering object directly
+                if creeper.debug_text_id.valid then
+                    creeper.debug_text_id.destroy()
+                end
+            elseif type(creeper.debug_text_id) == "number" then
+                -- It's a numeric ID
+                local old_text = rendering.get_object_by_id(creeper.debug_text_id)
+                if old_text and old_text.valid then
+                    old_text.destroy()
+                end
+            end
+        end
+        
+        -- Create new debug text
+        local debug_msg = string.format("Scouting: %d members", #members)
+        
+        creeper.debug_text_id = rendering.draw_text{
+            text = debug_msg,
+            surface = surface,
+            target = entity,
+            target_offset = {0, -2},
+            color = {r = 0, g = 1, b = 0},
+            scale = 1.0,
+            alignment = "center"
+        }
     end
 
     if creeper.is_leader then

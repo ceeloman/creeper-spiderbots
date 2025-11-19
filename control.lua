@@ -6,6 +6,8 @@
 local manager = require "scripts.creeperbot_manager"
 local behavior = require "scripts.creeperbot_behavior"
 local utils = require "scripts.utils"
+local waypoints = require "scripts.behavior.waypoints"
+local config = require "scripts.behavior.config"
 
 -- Centralized logging function
 local function log(message, level)
@@ -98,8 +100,52 @@ end
 -- Handle entity death and rendering cleanup
 local function handle_entity_death(event)
     local entity = event.entity
-    if entity and is_creeperbot(entity.name) then
+    if entity and entity.valid and is_creeperbot(entity.name) then
         local creeper = storage.creeperbots[entity.unit_number]
+        local position = entity.position
+        local surface = entity.surface
+        
+        -- Get tier config for explosion damage
+        local tier = config.tier_configs[entity.name] or config.tier_configs["creeperbot-mk1"]
+        
+        -- Create explosion and damage nearby entities
+        if position and surface and surface.valid and entity.valid then
+            local explosion_range = tier.radius or 3.5
+            
+            -- Create explosion entity
+            if tier.explosion == "nuke-explosion" then
+                surface.create_entity({name = "nuke-explosion", position = position})
+                -- Destroy nearby cliffs
+                local cliffs = surface.find_entities_filtered{position = position, radius = 9, type = "cliff"}
+                for _, cliff in pairs(cliffs) do
+                    cliff.destroy()
+                end
+                -- Create additional atomic explosions
+                for _ = 1, 3 do
+                    surface.create_entity({name = "atomic-explosion", position = position})
+                end
+                -- Create extra effect if specified
+                if tier.extra_effect then
+                    surface.create_entity({name = tier.extra_effect, position = position})
+                end
+            else
+                surface.create_entity({name = tier.explosion, position = position})
+            end
+            
+            -- Damage nearby enemy entities
+            local nearby_entities = surface.find_entities_filtered{
+                position = position,
+                radius = explosion_range,
+                force = "enemy"
+            }
+            for _, nearby_entity in pairs(nearby_entities) do
+                if nearby_entity.valid and nearby_entity.health and nearby_entity.health > 0 then
+                    nearby_entity.damage(tier.damage, "enemy", "explosion")
+                end
+            end
+        end
+        
+        -- Clean up renderings
         if creeper and creeper.render_ids then
             for _, id in pairs(creeper.render_ids) do
                 rendering.destroy(id)
@@ -116,10 +162,10 @@ local function process_creeperbots(event)
         if creeper.entity and creeper.entity.valid then
             local party = storage.parties[creeper.party_id]
             if creeper.state == "distractor" then
-                process_waypoints(creeper)
+                waypoints.process_waypoints(creeper)
             end
             if creeper.is_leader and creeper.state == "scouting" then
-                process_waypoints(creeper)
+                waypoints.process_waypoints(creeper)
             end
             ::continue::
         end
@@ -299,11 +345,19 @@ local function evaluate_grouping(event)
         log("Party " .. party_id .. " - Members: " .. #members .. ", Distractors: " .. #distractors .. ", State: " .. party.state)
 
         if party.state == "grouping" then
-            local time_elapsed = event.tick - (party.grouping_start_tick or event.tick)
-            local timeout_elapsed = time_elapsed >= 1200
-            local size_ok = #members >= 3
+            -- Use same criteria as grouping.lua for consistency
+            if not party.grouping_start_tick then
+                party.grouping_start_tick = event.tick
+            end
+            
+            local time_elapsed = event.tick - party.grouping_start_tick
+            local min_time = (#members >= 3) and 600 or 900  -- 10 seconds for groups, 15 seconds for smaller groups
+            local has_leader = party.grouping_leader and storage.creeperbots[party.grouping_leader] and storage.creeperbots[party.grouping_leader].entity and storage.creeperbots[party.grouping_leader].entity.valid
+            local timeout_elapsed = time_elapsed >= min_time
+            local size_ok = #members >= 1  -- Allow solo bots
 
-            if timeout_elapsed and size_ok then
+            if not party.started_scouting and timeout_elapsed and size_ok and has_leader then
+                party.started_scouting = true
                 party.state = "scouting"
                 party.follower_targets = party.follower_targets or {}
                 for _, member in ipairs(members) do
@@ -514,6 +568,70 @@ local function handle_path_request(event)
     storage.path_requests[event.id] = nil
 end
 
+-- Handle player clicking on a creeperbot - print debug info
+local function handle_selected_entity(event)
+    local player = game.get_player(event.player_index)
+    if not player then return end
+    
+    local selected = player.selected
+    if not selected or not selected.valid then return end
+    
+    if is_creeperbot(selected.name) then
+        local creeper = storage.creeperbots[selected.unit_number]
+        if creeper then
+            local party = creeper.party_id and storage.parties[creeper.party_id] or nil
+            local follow_target = selected.follow_target
+            local autopilot_dest = selected.autopilot_destination
+            local autopilot_dests = selected.autopilot_destinations
+            
+            local debug_info = {
+                "=== Creeperbot Debug Info ===",
+                "Unit Number: " .. selected.unit_number,
+                "State: " .. (creeper.state or "nil"),
+                "Party ID: " .. (creeper.party_id or "none"),
+                "Is Leader: " .. tostring(creeper.is_leader or false),
+                "Is Guard: " .. tostring(creeper.is_guard or false),
+                "Is Distractor: " .. tostring(creeper.is_distractor or false),
+                "Health: " .. string.format("%.1f", selected.health),
+                "Position: (" .. string.format("%.1f", selected.position.x) .. ", " .. string.format("%.1f", selected.position.y) .. ")",
+            }
+            
+            if party then
+                table.insert(debug_info, "Party State: " .. (party.state or "nil"))
+                table.insert(debug_info, "Party Members: " .. (party.grouping_leader and "has leader" or "no leader"))
+            end
+            
+            if follow_target and follow_target.valid then
+                table.insert(debug_info, "Follow Target: " .. follow_target.name .. " (" .. string.format("%.1f", follow_target.position.x) .. ", " .. string.format("%.1f", follow_target.position.y) .. ")")
+            else
+                table.insert(debug_info, "Follow Target: none")
+            end
+            
+            if autopilot_dest then
+                table.insert(debug_info, "Autopilot Dest: (" .. string.format("%.1f", autopilot_dest.x) .. ", " .. string.format("%.1f", autopilot_dest.y) .. ")")
+            else
+                table.insert(debug_info, "Autopilot Dest: none")
+            end
+            
+            if autopilot_dests and #autopilot_dests > 0 then
+                table.insert(debug_info, "Autopilot Queue: " .. #autopilot_dests .. " waypoints")
+            else
+                table.insert(debug_info, "Autopilot Queue: empty")
+            end
+            
+            if creeper.target and creeper.target.valid then
+                table.insert(debug_info, "Target: " .. creeper.target.name .. " (" .. string.format("%.1f", creeper.target.position.x) .. ", " .. string.format("%.1f", creeper.target.position.y) .. ")")
+            else
+                table.insert(debug_info, "Target: none")
+            end
+            
+            for _, line in ipairs(debug_info) do
+                player.print(line)
+            end
+        end
+    end
+end
+
 -- Register event handlers
 script.on_init(initialize_storage)
 script.on_configuration_changed(initialize_storage)
@@ -524,6 +642,8 @@ script.on_event(defines.events.script_raised_revive, handle_entity_creation)
 
 script.on_event(defines.events.on_player_mined_entity, cleanup_creeperbot)
 script.on_event(defines.events.on_entity_died, handle_entity_death)
+
+script.on_event(defines.events.on_selected_entity_changed, handle_selected_entity)
 
 script.on_nth_tick(15, process_autopilot_queue) 
 script.on_nth_tick(30, process_creeperbots)

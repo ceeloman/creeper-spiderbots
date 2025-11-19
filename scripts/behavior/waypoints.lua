@@ -270,6 +270,8 @@ function waypoints.process_waypoints(creeper)
                 --game.print("Debug: Leader " .. creeper.unit_number .. " detected " .. target_type .. " at (" .. target.position.x .. "," .. target.position.y .. "), transitioning party to preparing_to_attack, tick: " .. game.tick)
                 for unit_number, member in pairs(storage.creeperbots or {}) do
                     if member.party_id == creeper.party_id and member.entity and member.entity.valid then
+                        -- Clear follow_target before transitioning
+                        member.entity.follow_target = nil
                         member.state = "preparing_to_attack"
                         update_color(member.entity, "preparing_to_attack")
                         member.entity.autopilot_destination = nil

@@ -11,6 +11,7 @@ local distractor_state = require "scripts.behavior.states.distractor"
 local exploding_state = require "scripts.behavior.states.exploding"
 local remote_controlled_state = require "scripts.behavior.states.remote_controlled"
 local waypoints = require "scripts.behavior.waypoints"
+local config = require "scripts.behavior.config"
 
 -- Main update function acting as a state machine dispatcher
 function update_creeperbot(creeper, event)
@@ -26,7 +27,7 @@ function update_creeperbot(creeper, event)
 
     if creeper.state == "waking" then
         waking_state.handle_waking_state(creeper, event, position, entity, surface, tier)
-        local queue = storage.scheduled_autopilots and storage.scheduled_autopilots[entity.unit_number] or {}
+        
         if not queue.destination and not entity.autopilot_destination and not creeper.waking_initialized then
             local random = game.create_random_generator()
             local roll = random(1, 100)
@@ -41,7 +42,13 @@ function update_creeperbot(creeper, event)
                     creeper.party_id = party_id
                     creeper.state = "grouping"
                     update_color(entity, "grouping")
+                    -- Reset grouping_initialized so bot properly joins party with fresh timer
+                    creeper.grouping_initialized = false
                     new_party.last_join_tick = game.tick
+                    -- Reset the party's grouping timer when bot joins after waking
+                    if new_party.grouping_start_tick then
+                        new_party.grouping_start_tick = game.tick
+                    end
                     --game.print("CreeperBot " .. entity.unit_number .. " joined group, leader: " .. new_party.grouping_leader)
                 else
                     --game.print("CreeperBot " .. entity.unit_number .. " failed to join group, no leader found")
@@ -60,7 +67,6 @@ function update_creeperbot(creeper, event)
         preparing_to_attack_state.handle_preparing_to_attack_state(creeper, event, position, entity, surface, tier, party)
     elseif creeper.state == "exploding" then
         -- Get the full tier config from entity name, not just the tier number
-        local config = require "scripts.behavior.config"
         local tier_config = config.tier_configs[entity.name] or config.tier_configs["creeperbot-mk1"]
         exploding_state.handle_exploding_state(creeper, event, position, entity, surface, tier_config, party)
     end
@@ -70,3 +76,7 @@ function update_creeperbot(creeper, event)
     end
 end
 
+local state_machine = {}
+state_machine.update_creeperbot = update_creeperbot
+
+return state_machine

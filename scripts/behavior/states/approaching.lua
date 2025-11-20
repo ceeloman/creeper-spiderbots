@@ -129,8 +129,9 @@ function approaching_state.handle_approaching_state(creeper, event, position, en
             creeper.target_position = new_target.position
             creeper.target_health = new_target.health
         else
-            -- No target found, reform into formation (waking state)
-            -- Clear all attack-related data
+            -- No target found
+            -- If guard was part of a party, return to grouping state to retake position
+            -- Otherwise, reform into formation (waking state)
             creeper.target = nil
             creeper.target_position = nil
             creeper.target_health = nil
@@ -144,7 +145,16 @@ function approaching_state.handle_approaching_state(creeper, event, position, en
                 storage.scheduled_autopilots[entity.unit_number] = nil
             end
             
-            -- Clear all grouping/party state to start fresh
+            -- If guard was part of a party, return to grouping to retake guard position
+            if creeper.party_id and party and party.state == "grouping" and creeper.is_guard then
+                -- Reset grouping initialization so guard can retake position
+                creeper.grouping_initialized = false
+                creeper.state = "grouping"
+                update_color(entity, "grouping")
+                return false
+            end
+            
+            -- Otherwise, clear all grouping/party state to start fresh
             creeper.grouping_initialized = false
             creeper.party_id = nil
             creeper.is_leader = false
@@ -173,21 +183,64 @@ function approaching_state.handle_approaching_state(creeper, event, position, en
     local tier_config = config.tier_configs[entity.name] or config.tier_configs["creeperbot-mk1"]
     local explosion_range = tier_config.radius or 3.5
     
-    -- Explosion distance depends on target type:
-    -- Nests have large radius, bots can't get to center - use explosion_range + 5 tiles
-    -- Units are smaller - use 2 tiles
-    local explosion_distance = explosion_range + 5  -- Default for nests
-    if creeper.target and creeper.target.valid then
-        if creeper.target.type == "unit" then
-            explosion_distance = 2  -- Units need to be closer
-        end
-    end
+    -- Explode when within 2 tiles of target (for all target types)
+    local explosion_distance = 2
 
     -- Transition to exploding state if within explosion range
     if dist_to_target <= explosion_distance then
         creeper.state = "exploding"
         update_color(entity, "exploding")
         return true
+    end
+
+    -- PRIORITY: Use teleportation for long distances (>30 tiles) - check this FIRST
+    if dist_to_target > 30 then
+        -- Far away - teleport toward target with random offset (not landing exactly on target)
+        -- Check cooldown to prevent constant teleporting (every 60 ticks)
+        if not creeper.last_teleport_tick or event.tick >= creeper.last_teleport_tick + 60 then
+            -- Calculate landing position: random offset within 10 tiles of target
+            local random = game.create_random_generator()
+            local offset_radius = 3 + random() * 7  -- 3-10 tiles from target
+            local landing_pos = get_random_position_in_radius(target_pos, offset_radius)
+            
+            -- Find a safe non-colliding position near the landing point
+            local safe_landing_pos = surface.find_non_colliding_position("character", landing_pos, 20, 0.5)
+            if not safe_landing_pos then
+                safe_landing_pos = landing_pos
+            end
+            
+            -- Clear movement state before teleporting (clear all autopilot destinations)
+            entity.autopilot_destination = nil
+            local attempts = 0
+            while entity.autopilot_destinations and #entity.autopilot_destinations > 0 and attempts < 20 do
+                entity.autopilot_destination = nil
+                attempts = attempts + 1
+            end
+            if storage.scheduled_autopilots and storage.scheduled_autopilots[creeper.unit_number] then
+                storage.scheduled_autopilots[creeper.unit_number] = nil
+            end
+            
+            -- Teleport to landing position (target data is preserved in creeper, will be stored in teleport)
+            -- Note: We clear target AFTER teleportation so bot searches for new target near landing
+            create_creeperbot_projectile(position, safe_landing_pos, creeper, 3)
+            
+            -- Clear target AFTER storing in teleport data so bot will search for new target near landing position
+            creeper.target = nil
+            creeper.target_position = nil
+            creeper.target_health = nil
+            if party then party.shared_target = nil end
+            creeper.last_teleport_tick = event.tick
+            return true
+        else
+            -- On cooldown - use pathfinding as fallback
+            if not entity.autopilot_destination then
+                if not creeper.last_path_request or event.tick >= creeper.last_path_request + 60 then
+                    request_multiple_paths(position, target_pos, party, surface, creeper.unit_number)
+                    creeper.last_path_request = event.tick
+                end
+            end
+        end
+        return true  -- Return early after teleportation check
     end
 
     -- Check if we just reached a waypoint (no current destination but waypoints remain)
@@ -235,17 +288,9 @@ function approaching_state.handle_approaching_state(creeper, event, position, en
         end
     end
 
-    -- Use pathfinding for long distances, autopilot when close
-    -- If no autopilot destination and far away, request pathfinding
-    if not entity.autopilot_destination then
-        if dist_to_target > 20 then
-            -- Far away - use pathfinding to handle obstacles
-            if not creeper.last_path_request or event.tick >= creeper.last_path_request + 60 then
-                request_multiple_paths(position, target_pos, party, surface, creeper.unit_number)
-                creeper.last_path_request = event.tick
-            end
-        elseif dist_to_target > explosion_distance then
-            -- Close but not at explosion range - set autopilot directly to target
+    -- Close but not at explosion range - set autopilot directly to target
+    if dist_to_target > explosion_distance then
+        if not entity.autopilot_destination then
             local success, err = pcall(function()
                 entity.add_autopilot_destination(target_pos)
             end)
@@ -260,4 +305,5 @@ function approaching_state.handle_approaching_state(creeper, event, position, en
 end
 
 return approaching_state
+
 

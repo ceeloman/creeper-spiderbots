@@ -33,6 +33,26 @@ end
 local function handle_entity_creation(event)
     local entity = event.created_entity or event.entity
     if entity and entity.valid and is_creeperbot(entity.name) then
+        -- Check if this is a teleported bot (created via script with raise_built=true)
+        -- If so, let handle_trigger_created_entity handle it to preserve teleportation state
+        if storage.pending_teleports then
+            for key, teleport_data in pairs(storage.pending_teleports) do
+                if teleport_data.bot_name == entity.name then
+                    local distance = calculate_distance(entity.position, teleport_data.destination)
+                    if distance < 10 then  -- Within 10 tiles of destination
+                        -- This is a teleported bot - let handle_trigger_created_entity handle it
+                        -- We need to create a fake trigger event for it
+                        handle_trigger_created_entity({
+                            entity = entity,
+                            source = event.source or entity
+                        })
+                        return
+                    end
+                end
+            end
+        end
+        
+        -- Not a teleported bot - register normally
         register_creeperbot(entity)
         log("Registered Creeperbot " .. entity.unit_number)
     end
@@ -45,26 +65,13 @@ local function handle_trigger_created_entity(event)
         return
     end
     
-    local source = event.source
-    if not (source and source.valid) then
-        return
-    end
-    
-    -- Check if this is a teleported bot (has stored state)
-    -- We use the source entity's unit_number to find the pending teleport
-    -- Since the source is the old entity that was destroyed, we need to match by position or use a different method
-    -- Actually, we'll store by the old unit_number and match when the new entity is created
-    
-    -- For now, register normally - we'll restore state after registration
-    register_creeperbot(entity)
-    
-    -- Try to find and restore state from pending teleports
+    -- Check if this is a teleported bot (has stored state) BEFORE checking source
     -- We match by finding the closest pending teleport to the new entity's position
+    local best_match = nil
+    local best_distance = math.huge
+    local match_key = nil
+    
     if storage.pending_teleports then
-        local best_match = nil
-        local best_distance = math.huge
-        local match_key = nil
-        
         for key, teleport_data in pairs(storage.pending_teleports) do
             if teleport_data.bot_name == entity.name then
                 local distance = calculate_distance(entity.position, teleport_data.destination)
@@ -75,37 +82,107 @@ local function handle_trigger_created_entity(event)
                 end
             end
         end
-        
-        if best_match then
-            -- Restore the creeperbot's state
-            local creeper = storage.creeperbots[entity.unit_number]
-            if creeper then
-                -- Restore state
-                creeper.state = best_match.state
-                creeper.party_id = best_match.party_id
-                creeper.is_leader = best_match.is_leader
-                creeper.is_guard = best_match.is_guard
-                creeper.is_distractor = best_match.is_distractor
-                creeper.target = best_match.target
-                creeper.target_position = best_match.target_position
-                creeper.target_health = best_match.target_health
-                
-                -- Restore follow target if it was set
-                if best_match.follow_target and best_match.follow_target.valid then
-                    entity.follow_target = best_match.follow_target
-                end
-                
-                -- Update color based on restored state
-                update_color(entity, creeper.state)
-                
-                log("Restored creeperbot " .. entity.unit_number .. " state after teleportation")
-            end
-            
-            -- Clean up pending teleport
-            storage.pending_teleports[match_key] = nil
+    end
+    
+    -- For non-teleported bots (normal trigger_created_entity), require valid source
+    -- For teleported bots (from script_raised_built), source may not be available
+    if not best_match then
+        local source = event.source
+        if not (source and source.valid) then
+            return
         end
     end
+    
+    if best_match then
+        -- Check if already registered (could happen if both script_raised_built and on_trigger_created_entity fire)
+        if storage.creeperbots and storage.creeperbots[entity.unit_number] then
+            -- Already registered - just clean up the pending teleport
+            storage.pending_teleports[match_key] = nil
+            return
+        end
+        
+        -- This is a teleported bot - register it but skip the default initialization
+        -- Create creeper entry manually to preserve teleported state
+        if not storage.creeperbots then storage.creeperbots = {} end
+        if not storage.parties then storage.parties = {} end
+        
+        entity.entity_label = tostring(entity.unit_number)
+        
+        -- Create creeper table with restored state - restore ALL fields
+        local creeper = {
+            entity = entity,
+            unit_number = entity.unit_number,
+            state = best_match.state or "waking",  -- Restore state immediately
+            party_id = best_match.party_id,  -- Restore party_id
+            is_leader = best_match.is_leader or false,  -- Restore is_leader
+            is_guard = best_match.is_guard or false,  -- Restore is_guard
+            is_distractor = best_match.is_distractor or false,  -- Restore is_distractor
+            target = best_match.target,  -- Restore target (may be nil if cleared)
+            target_position = best_match.target_position,  -- Restore target_position
+            target_health = best_match.target_health,  -- Restore target_health
+            assigned_target = best_match.assigned_target,  -- Restore assigned_target
+            tier = best_match.tier or get_creeperbot_tier(entity.name),  -- Restore tier
+            last_teleport_tick = best_match.last_teleport_tick,  -- Restore teleport cooldown
+            last_path_request = best_match.last_path_request,  -- Restore path request timing
+            last_movement_update = best_match.last_movement_update,  -- Restore movement update timing
+            last_target_search = best_match.last_target_search,  -- Restore target search timing
+            last_health = best_match.last_health,  -- Restore health tracking
+            max_health = best_match.max_health,  -- Restore max health
+            waking_initialized = best_match.waking_initialized,  -- Restore waking state
+            grouping_initialized = best_match.grouping_initialized,  -- Restore grouping state
+            distract_start_tick = best_match.distract_start_tick,  -- Restore distractor timing
+            distract_end_tick = best_match.distract_end_tick,  -- Restore distractor timing
+            diversion_position = best_match.diversion_position,  -- Restore diversion position
+            render_ids = best_match.render_ids,  -- Restore renderings
+        }
+        
+        -- Store the creeper
+        storage.creeperbots[entity.unit_number] = creeper
+        
+        -- Restore autopilot destinations for leaders
+        if best_match.is_leader and best_match.autopilot_destinations and #best_match.autopilot_destinations > 0 then
+            entity.autopilot_destination = nil
+            local attempts = 0
+            while entity.autopilot_destinations and #entity.autopilot_destinations > 0 and attempts < 20 do
+                entity.autopilot_destination = nil
+                attempts = attempts + 1
+            end
+            -- Restore saved waypoints
+            for _, waypoint in ipairs(best_match.autopilot_destinations) do
+                entity.add_autopilot_destination(waypoint)
+            end
+            log("Restored " .. #best_match.autopilot_destinations .. " autopilot destinations for leader " .. entity.unit_number)
+        else
+            -- Clear autopilot destinations for followers
+            entity.autopilot_destination = nil
+            local attempts = 0
+            while entity.autopilot_destinations and #entity.autopilot_destinations > 0 and attempts < 20 do
+                entity.autopilot_destination = nil
+                attempts = attempts + 1
+            end
+            if storage.scheduled_autopilots and storage.scheduled_autopilots[entity.unit_number] then
+                storage.scheduled_autopilots[entity.unit_number] = nil
+            end
+        end
+        
+        -- Restore follow target if it was set
+        if best_match.follow_target and best_match.follow_target.valid then
+            entity.follow_target = best_match.follow_target
+        end
+        
+        -- Update color based on restored state
+        update_color(entity, creeper.state)
+        
+        log("Restored teleported creeperbot " .. entity.unit_number .. " with state " .. creeper.state .. " (leader: " .. tostring(creeper.is_leader) .. ")")
+        
+        -- Clean up pending teleport
+        storage.pending_teleports[match_key] = nil
+    else
+        -- Not a teleported bot - register normally
+        register_creeperbot(entity)
+    end
 end
+
 
 -- Create a projectile that spawns a creeperbot where it lands (for teleportation)
 -- @param origin MapPosition - where the projectile starts
@@ -113,7 +190,7 @@ end
 -- @param creeper table - the creeperbot data to preserve
 -- @param speed_multiplier number? - multiplier for projectile speed
 -- @param speed_override number? - override speed (if provided, speed_multiplier is ignored)
-local function create_creeperbot_projectile(origin, destination, creeper, speed_multiplier, speed_override)
+function create_creeperbot_projectile(origin, destination, creeper, speed_multiplier, speed_override)
     if not (creeper and creeper.entity and creeper.entity.valid) then
         return
     end
@@ -127,6 +204,17 @@ local function create_creeperbot_projectile(origin, destination, creeper, speed_
     -- Store creeperbot state for restoration after teleportation
     local teleport_key = "teleport_" .. entity.unit_number .. "_" .. game.tick
     storage.pending_teleports = storage.pending_teleports or {}
+    
+    -- Store autopilot destinations for leaders (they need to continue their path)
+    local saved_autopilot_destinations = nil
+    if creeper.is_leader and entity.autopilot_destinations and #entity.autopilot_destinations > 0 then
+        saved_autopilot_destinations = {}
+        for i, waypoint in ipairs(entity.autopilot_destinations) do
+            table.insert(saved_autopilot_destinations, {x = waypoint.x, y = waypoint.y})
+        end
+    end
+    
+    -- Store ALL creeper data to preserve state completely
     storage.pending_teleports[teleport_key] = {
         bot_name = entity.name,
         destination = destination,
@@ -138,7 +226,22 @@ local function create_creeperbot_projectile(origin, destination, creeper, speed_
         target = creeper.target,
         target_position = creeper.target_position,
         target_health = creeper.target_health,
+        assigned_target = creeper.assigned_target,
         follow_target = entity.follow_target,
+        autopilot_destinations = saved_autopilot_destinations,  -- Store waypoints for leaders
+        tier = creeper.tier,
+        last_teleport_tick = creeper.last_teleport_tick,
+        last_path_request = creeper.last_path_request,
+        last_movement_update = creeper.last_movement_update,
+        last_target_search = creeper.last_target_search,
+        last_health = creeper.last_health,
+        max_health = creeper.max_health,
+        waking_initialized = creeper.waking_initialized,
+        grouping_initialized = creeper.grouping_initialized,
+        distract_start_tick = creeper.distract_start_tick,
+        distract_end_tick = creeper.distract_end_tick,
+        diversion_position = creeper.diversion_position,
+        render_ids = creeper.render_ids,  -- Preserve renderings
     }
     
     -- Create the projectile
@@ -195,6 +298,16 @@ local function cleanup_creeperbot(entity)
                 if party.follower_targets then
                     party.follower_targets[unit_number] = nil
                     log("Removed unit " .. unit_number .. " from follower_targets in party " .. creeper.party_id)
+                end
+                
+                -- Clear guard assignments if this was a guard
+                if creeper.is_guard and party.guard_assignments then
+                    for enemy_unit_number, guard_unit_number in pairs(party.guard_assignments) do
+                        if guard_unit_number == unit_number then
+                            party.guard_assignments[enemy_unit_number] = nil
+                            log("Cleared guard assignment for enemy " .. enemy_unit_number .. " (guard " .. unit_number .. " died)")
+                        end
+                    end
                 end
 
                 -- Reassign leader or remove party
@@ -344,7 +457,7 @@ local function process_scheduled_autopilots(event)
     for unit_number, scheduled in pairs(storage.scheduled_autopilots) do
         local creeper = storage.creeperbots[unit_number]
         if creeper and creeper.entity and creeper.entity.valid and event.tick >= scheduled.tick then
-            if creeper.entity.follow_target or creeper.state == "scouting" or creeper.state == "guard" or creeper.state == "approaching" or creeper.state == "exploding" then
+            if creeper.entity.follow_target or creeper.state == "scouting" or creeper.state == "guard" or creeper.state == "approaching" or creeper.state == "exploding" or creeper.state == "defensive_formation" then
                 storage.scheduled_autopilots[unit_number] = nil
                 log("Skipped autopilot for unit " .. unit_number .. " due to state " .. creeper.state)
             else
@@ -359,8 +472,8 @@ end
 -- Check if creeperbots are too far from their follow target and teleport them closer
 local function check_and_teleport_stuck_bots(event)
     -- Distance thresholds (in tiles)
-    local max_range = 150  -- Normal max range
-    local double_max_range = 300  -- Greatly exceeds range
+    local max_range = 70  -- Normal max range
+    local double_max_range = 140  -- Greatly exceeds range
     
     for unit_number, creeper in pairs(storage.creeperbots or {}) do
         if not (creeper.entity and creeper.entity.valid) then
@@ -425,7 +538,18 @@ local function update_creeperbots(event)
             elseif creeper.state == "scouting" and not creeper.is_leader and creeper.entity.follow_target then
                 -- Skip follower in scouting state with follow target
             elseif creeper.state == "approaching" and creeper.entity.autopilot_destination then
-                -- Skip approaching with autopilot destination
+                -- Check if far enough to teleport (>50 tiles) - if so, still update to allow teleportation
+                if creeper.target and creeper.target.valid then
+                    local dist = math.sqrt((creeper.entity.position.x - creeper.target.position.x)^2 + (creeper.entity.position.y - creeper.target.position.y)^2)
+                    if dist > 30 then
+                        -- Far enough to teleport - update to allow teleportation check
+                        update_creeperbot(creeper, event)
+                    end
+                    -- Otherwise skip (let it move normally)
+                else
+                    -- No target, update to find new one
+                    update_creeperbot(creeper, event)
+                end
             elseif creeper.state == "distractor" and creeper.entity.autopilot_destination then
                 -- Skip distractor with autopilot destination
             elseif creeper.state == "exploding" and creeper.entity.autopilot_destination then
@@ -561,14 +685,40 @@ local function evaluate_grouping(event)
                     end
                 end
 
-                local target_pos = get_unvisited_chunk(leader_pos, party)
-                if target_pos.x == leader_pos.x and target_pos.y == leader_pos.y then
+                -- Check if leader is near water before starting scouting
+                local actual_leader_pos = leader.entity.position
+                if is_position_on_water(surface, actual_leader_pos, 2.5) then
+                    local safe_pos = find_safe_position_away_from_water(surface, leader.entity, actual_leader_pos, 30)
+                    if safe_pos then
+                        leader.entity.autopilot_destination = nil
+                        leader.entity.add_autopilot_destination(safe_pos)
+                        log("Leader " .. leader.unit_number .. " is near water, moving to safe position at (" .. string.format("%.1f", safe_pos.x) .. ", " .. string.format("%.1f", safe_pos.y) .. ") before scouting")
+                        goto continue
+                    else
+                        log("Warning: Leader " .. leader.unit_number .. " is near water but could not find safe position")
+                    end
+                end
+
+                local target_pos = get_unvisited_chunk(actual_leader_pos, party)
+                if target_pos.x == actual_leader_pos.x and target_pos.y == actual_leader_pos.y then
                     log("No valid chunk found for party " .. party_id, "error")
                     goto continue
                 end
 
+                -- Verify target position is not in water
+                if is_position_on_water(surface, target_pos, 1.5) then
+                    local safe_target = find_safe_position_away_from_water(surface, leader.entity, target_pos, 30)
+                    if safe_target then
+                        target_pos = safe_target
+                        log("Target chunk position was in water, using safe alternative at (" .. string.format("%.1f", safe_target.x) .. ", " .. string.format("%.1f", safe_target.y) .. ")")
+                    else
+                        log("Warning: Target chunk position is in water and no safe alternative found")
+                        goto continue
+                    end
+                end
+
                 leader.entity.autopilot_destination = nil
-                request_multiple_paths(leader_pos, target_pos, party, surface, leader.unit_number)
+                request_multiple_paths(actual_leader_pos, target_pos, party, surface, leader.unit_number)
                 log("Leader " .. leader.unit_number .. " set path to (" .. target_pos.x .. "," .. target_pos.y .. ")")
 
                 for _, distractor in ipairs(distractors) do
@@ -743,13 +893,25 @@ local function handle_path_request(event)
             log("Path request " .. event.id .. " failed, will retry later")
             local surface = creeper.entity.surface
             local path_collision_mask = {
-                layers = { water_tile = true, cliff = true },
+                layers = { water_tile = true },  -- Removed cliff = true
                 colliding_with_tiles_only = true,
                 consider_tile_transitions = true
             }
+            -- Define start_offsets to match the ones used in request_multiple_paths
+            local start_offsets = {
+                {x = 0, y = 0},
+                --[[
+                {x = 0, y = 4},
+                {x = 4, y = 0},
+                {x = -4, y = 0},
+                {x = 0, y = -4},
+                ]]
+            }
+            -- Use creeper's current position as start (with offset if needed)
+            local current_pos = creeper.entity.position
             local start_pos = {
-                x = request.target_pos.x + start_offsets[request.start_offset_index].x,
-                y = request.target_pos.y + start_offsets[request.start_offset_index].y
+                x = current_pos.x + start_offsets[request.start_offset_index].x,
+                y = current_pos.y + start_offsets[request.start_offset_index].y
             }
             local new_request_id = surface.request_path{
                 start = start_pos,
@@ -789,11 +951,53 @@ local function handle_path_request(event)
         log("Cleared follow_target for unit " .. request.creeper_unit_number .. " before setting autopilot path")
     end
     
-    creeper.entity.autopilot_destination = nil
+    -- Filter out water waypoints and ensure first waypoint is safe
+    local surface = creeper.entity.surface
+    local safe_waypoints = {}
+    local skipped_water = 0
+    
     for _, waypoint in ipairs(event.path) do
-        creeper.entity.add_autopilot_destination(waypoint.position)
+        -- Check if waypoint is on water
+        if not is_position_on_water(surface, waypoint.position, 1.5) then
+            table.insert(safe_waypoints, waypoint.position)
+        else
+            skipped_water = skipped_water + 1
+            -- If this is the first waypoint and it's in water, try to find a safe alternative
+            if #safe_waypoints == 0 then
+                local current_pos = creeper.entity.position
+                local safe_pos = find_safe_position_away_from_water(surface, creeper.entity, current_pos, 10)
+                if safe_pos then
+                    table.insert(safe_waypoints, safe_pos)
+                    log("First waypoint was in water, using safe alternative at (" .. string.format("%.1f", safe_pos.x) .. ", " .. string.format("%.1f", safe_pos.y) .. ")")
+                end
+            end
+        end
     end
-    log("Set " .. #event.path .. " autopilot destinations for unit " .. request.creeper_unit_number .. " (state: " .. (creeper.state or "nil") .. ") to (" .. request.target_pos.x .. "," .. request.target_pos.y .. ")")
+    
+    -- If we filtered out all waypoints, try to find a safe path to the target
+    if #safe_waypoints == 0 then
+        local current_pos = creeper.entity.position
+        local safe_pos = find_safe_position_away_from_water(surface, creeper.entity, request.target_pos, 30)
+        if safe_pos then
+            table.insert(safe_waypoints, safe_pos)
+            log("All waypoints were in water, using safe alternative target at (" .. string.format("%.1f", safe_pos.x) .. ", " .. string.format("%.1f", safe_pos.y) .. ")")
+        else
+            log("Warning: Could not find safe waypoints for unit " .. request.creeper_unit_number)
+            storage.path_requests[event.id] = nil
+            return
+        end
+    end
+    
+    creeper.entity.autopilot_destination = nil
+    for _, waypoint_pos in ipairs(safe_waypoints) do
+        creeper.entity.add_autopilot_destination(waypoint_pos)
+    end
+    
+    if skipped_water > 0 then
+        log("Set " .. #safe_waypoints .. " safe autopilot destinations for unit " .. request.creeper_unit_number .. " (skipped " .. skipped_water .. " water waypoints) to (" .. request.target_pos.x .. "," .. request.target_pos.y .. ")")
+    else
+        log("Set " .. #safe_waypoints .. " autopilot destinations for unit " .. request.creeper_unit_number .. " (state: " .. (creeper.state or "nil") .. ") to (" .. request.target_pos.x .. "," .. request.target_pos.y .. ")")
+    end
     
     if not is_distractor then
         local chunk_key = request.chunk_x .. "," .. request.chunk_y
@@ -1027,6 +1231,7 @@ script.on_configuration_changed(initialize_storage)
 script.on_event(defines.events.on_built_entity, handle_entity_creation)
 script.on_event(defines.events.on_robot_built_entity, handle_entity_creation)
 script.on_event(defines.events.script_raised_revive, handle_entity_creation)
+script.on_event(defines.events.script_raised_built, handle_entity_creation)
 script.on_event(defines.events.on_trigger_created_entity, handle_trigger_created_entity)
 
 script.on_event(defines.events.on_player_mined_entity, cleanup_creeperbot)

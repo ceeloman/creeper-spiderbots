@@ -15,9 +15,32 @@ function preparing_to_attack_state.handle_preparing_to_attack_state(creeper, eve
     update_color(entity, "preparing_to_attack")
 
     if not party then
+        creeper.preparing_to_attack_initialized = nil
         creeper.state = "grouping"
         update_color(entity, "grouping")
         return
+    end
+
+    -- Check if target is dead - if so, reform
+    if party.target_nest then
+        if not party.target_nest.valid or party.target_nest.health <= 0 then
+            -- Target is dead, clear attack state and reform
+            party.target_nest = nil
+            party.attack_initiated = false
+            party.scout_sent = false
+            creeper.target = nil
+            creeper.target_position = nil
+            creeper.target_health = nil
+            creeper.preparing_to_attack_initialized = nil
+            entity.follow_target = nil
+            entity.autopilot_destination = nil
+            if storage.scheduled_autopilots and storage.scheduled_autopilots[creeper.unit_number] then
+                storage.scheduled_autopilots[creeper.unit_number] = nil
+            end
+            creeper.state = "grouping"
+            update_color(entity, "grouping")
+            return
+        end
     end
 
     local leader = storage.creeperbots[party.grouping_leader]
@@ -30,12 +53,84 @@ function preparing_to_attack_state.handle_preparing_to_attack_state(creeper, eve
         leader_pos = entity.position
     end
 
+    -- CRITICAL: Clear all autopilot destinations ONCE when first entering preparing_to_attack state
+    -- This handles cases where bots were teleported and have old destinations
+    -- Only do this once, not every tick, so bots can actually move to their positions
+    if not creeper.preparing_to_attack_initialized then
+        -- Clear follow_target aggressively - this prevents weird movement
+        entity.follow_target = nil
+        entity.autopilot_destination = nil
+        -- Clear all autopilot destinations (autopilot_destinations is read-only, so we clear current destination repeatedly)
+        local attempts = 0
+        while entity.autopilot_destinations and #entity.autopilot_destinations > 0 and attempts < 20 do
+            entity.autopilot_destination = nil
+            attempts = attempts + 1
+        end
+        if storage.scheduled_autopilots and storage.scheduled_autopilots[creeper.unit_number] then
+            storage.scheduled_autopilots[creeper.unit_number] = nil
+        end
+        creeper.preparing_to_attack_initialized = true
+    end
+
     -- Leader clears movement during preparation phase only
     if creeper.is_leader and not party.attack_initiated then
         entity.autopilot_destination = nil
         entity.follow_target = nil
         if storage.scheduled_autopilots and storage.scheduled_autopilots[entity.unit_number] then
             storage.scheduled_autopilots[entity.unit_number] = nil
+        end
+        
+        -- Check if leader is being attacked - if so, trigger immediate scout
+        local is_being_attacked = false
+        if not creeper.last_health then
+            creeper.last_health = entity.health
+        end
+        if not creeper.max_health then
+            creeper.max_health = entity.health
+        end
+        if entity.health > creeper.max_health then
+            creeper.max_health = entity.health
+        end
+        local health_loss = creeper.last_health - entity.health
+        local health_threshold = math.max(5, creeper.max_health * 0.01)
+        if health_loss > health_threshold then
+            is_being_attacked = true
+        end
+        creeper.last_health = entity.health
+        
+        -- If leader is being attacked, find attacker and send scout immediately
+        if is_being_attacked and not party.scout_sent then
+            local nearby_enemies = surface.find_entities_filtered({
+                type = {"unit", "turret", "unit-spawner"},
+                position = position,
+                radius = 30,
+                force = "enemy"
+            })
+            
+            if #nearby_enemies > 0 then
+                -- Find closest enemy
+                local closest_enemy = nil
+                local min_dist = math.huge
+                for _, enemy in ipairs(nearby_enemies) do
+                    if enemy.valid and enemy.health > 0 then
+                        local dist = calculate_distance(position, enemy.position)
+                        if dist < min_dist then
+                            min_dist = dist
+                            closest_enemy = enemy
+                        end
+                    end
+                end
+                
+                if closest_enemy then
+                    -- Trigger scout immediately
+                    party.target_nest = closest_enemy
+                    party.target_health = closest_enemy.health
+                    party.target_max_health = closest_enemy.health
+                    party.scout_sent = false  -- Will be set to true in Phase 2
+                    party.attack_initiated = true
+                    party.attack_start_tick = event.tick
+                end
+            end
         end
     end
 
@@ -139,102 +234,155 @@ function preparing_to_attack_state.handle_preparing_to_attack_state(creeper, eve
         end
 
         -- ============================================
-        -- PHASE 2: SEND DISTRACTOR (After positioning)
+        -- PHASE 2: SEND SCOUT AND CALCULATE REQUIRED BOTS
         -- ============================================
-        if event.tick >= party.preparation_start_tick + 240 and 
-           (not party.last_distractor_election_tick or event.tick >= party.last_distractor_election_tick + 1200) then
-            
+        -- Immediately send one scout bot to get target health, then calculate and send required bots
+        if not party.scout_sent then
             local target, target_type = behavior_utils.scan_for_enemies(leader_pos, surface, config.tier_configs[entity.name].max_targeting)
             
-            if target and target_type == "nest" then
-                -- Find closest distractor in guard position
-                local closest_distractor = nil
+            if target and (target_type == "nest" or target_type == "unit" or target_type == "turret") then
+                -- Find closest bot to send as scout (prefer non-leader, non-distractor)
+                local scout_candidate = nil
                 local min_distance = math.huge
                 
-                for i, distractor in ipairs(distractors) do
-                    if distractor.entity and distractor.entity.valid and distractor.state == "preparing_to_attack" then
-                        local pos = guard_positions[i] or {angle = 180, radius = 3}
-                        local guard_pos = {
-                            x = math.floor(leader_pos.x + math.cos(math.rad(pos.angle)) * pos.radius),
-                            y = math.floor(leader_pos.y + math.sin(math.rad(pos.angle)) * pos.radius)
-                        }
-                        local dist_to_guard = calculate_distance(distractor.entity.position, guard_pos)
-                        
-                        -- Must be in guard position (within 3 tiles)
-                        if dist_to_guard < 3 then
-                            local dist_to_target = calculate_distance(distractor.entity.position, target.position)
+                for _, member in ipairs(members) do
+                    if member.entity and member.entity.valid and 
+                       member.state == "preparing_to_attack" and 
+                       not member.is_leader and 
+                       not member.is_distractor then
+                        local dist_to_target = calculate_distance(member.entity.position, target.position)
+                        if dist_to_target < min_distance then
+                            min_distance = dist_to_target
+                            scout_candidate = member
+                        end
+                    end
+                end
+                
+                -- If no non-distractor found, use any available bot
+                if not scout_candidate then
+                    for _, member in ipairs(members) do
+                        if member.entity and member.entity.valid and 
+                           member.state == "preparing_to_attack" and 
+                           not member.is_leader then
+                            local dist_to_target = calculate_distance(member.entity.position, target.position)
                             if dist_to_target < min_distance then
                                 min_distance = dist_to_target
-                                closest_distractor = distractor
+                                scout_candidate = member
                             end
                         end
                     end
                 end
                 
-                -- Send distractor
-                if closest_distractor then
-                    -- Calculate approach direction from distractor to nest
-                    -- This gives us the direction the distractor is MOVING (toward nest)
-                    local dx = target.position.x - closest_distractor.entity.position.x
-                    local dy = target.position.y - closest_distractor.entity.position.y
-                    local approach_angle = math.deg(math.atan2(dy, dx))
-                    if approach_angle < 0 then approach_angle = approach_angle + 360 end
-                    
-                    -- Calculate diversion position: 5 tiles away from nest
-                    -- Based on approach direction, move perpendicular (not continuing in same direction)
-                    local diversion_angle = nil
-                    local random = game.create_random_generator()
-                    
-                    if approach_angle >= 315 or approach_angle < 45 then
-                        -- Approaching from east (moving west, angle ~0° or 360°)
-                        -- Move northwest (315°) or southwest (225°) - NOT continuing west
-                        diversion_angle = random(1, 2) == 1 and 315 or 225
-                    elseif approach_angle >= 45 and approach_angle < 135 then
-                        -- Approaching from north (moving south, angle ~90°)
-                        -- Move northeast (45°) or northwest (315°)
-                        diversion_angle = random(1, 2) == 1 and 45 or 315
-                    elseif approach_angle >= 135 and approach_angle < 225 then
-                        -- Approaching from west (moving east, angle ~180°)
-                        -- Move southwest (225°) or southeast (135°)
-                        diversion_angle = random(1, 2) == 1 and 225 or 135
-                    elseif approach_angle >= 225 and approach_angle < 315 then
-                        -- Approaching from south (moving north, angle ~270°)
-                        -- Move southwest (225°) or southeast (135°)
-                        diversion_angle = random(1, 2) == 1 and 225 or 135
-                    else
-                        -- Default: move 90 degrees perpendicular
-                        diversion_angle = (approach_angle + 90) % 360
-                    end
-                    
-                    -- Calculate diversion position: 5 tiles from nest at calculated angle
-                    local diversion_pos = {
-                        x = math.floor(target.position.x + math.cos(math.rad(diversion_angle)) * 5),
-                        y = math.floor(target.position.y + math.sin(math.rad(diversion_angle)) * 5)
-                    }
-                    
-                    closest_distractor.entity.autopilot_destination = nil
-                    closest_distractor.state = "distractor"
-                    closest_distractor.target = target
-                    closest_distractor.target_position = target.position
-                    closest_distractor.diversion_position = diversion_pos
-                    distractor_state_module.handle_distractor_state(
-                        closest_distractor, 
-                        event, 
-                        closest_distractor.entity.position, 
-                        closest_distractor.entity, 
-                        surface, 
-                        config.tier_configs[entity.name], 
-                        party
-                    )
-                    closest_distractor.distract_start_tick = event.tick
-                    closest_distractor.distract_end_tick = event.tick + 600
-                    party.last_distractor_election_tick = event.tick
-                    
-                    -- CRITICAL: Mark attack as initiated and set delay for other bots
-                    -- Other bots wait 120 ticks (2 seconds) to give distractor time to run in
+                -- Send scout immediately
+                if scout_candidate then
+                    -- Store target info in party
+                    party.target_nest = target
+                    party.target_health = target.health
+                    party.target_max_health = target.health
+                    party.scout_sent = true
+                    party.scout_unit_number = scout_candidate.unit_number
                     party.attack_initiated = true
                     party.attack_start_tick = event.tick
-                    party.target_nest = target
+                    
+                    -- Send scout to target
+                    scout_candidate.target = target
+                    scout_candidate.target_position = target.position
+                    scout_candidate.target_health = target.health
+                    scout_candidate.preparing_to_attack_initialized = nil
+                    scout_candidate.entity.follow_target = nil
+                    scout_candidate.entity.autopilot_destination = nil
+                    scout_candidate.state = "approaching"
+                    update_color(scout_candidate.entity, "approaching")
+                    
+                    -- Path to target
+                    request_multiple_paths(scout_candidate.entity.position, target.position, party, surface, scout_candidate.unit_number)
+                end
+            end
+        end
+        
+        -- ============================================
+        -- PHASE 2B: CALCULATE AND SEND REQUIRED BOTS
+        -- ============================================
+        -- After scout is sent, calculate how many bots are needed and send them
+        if party.scout_sent and party.target_nest and party.target_nest.valid then
+            -- Update target health continuously
+            local target = party.target_nest
+            if target.valid and target.health > 0 then
+                party.target_health = target.health
+            else
+                -- Target is dead, reform
+                party.target_nest = nil
+                party.attack_initiated = false
+                party.scout_sent = false
+                return
+            end
+            
+            -- Calculate average damage of all bots in party (including scout)
+            local total_damage = 0
+            local bot_count = 0
+            for _, member in ipairs(members) do
+                if member.entity and member.entity.valid then
+                    local tier_config = config.tier_configs[member.entity.name] or config.tier_configs["creeperbot-mk1"]
+                    total_damage = total_damage + tier_config.damage
+                    bot_count = bot_count + 1
+                end
+            end
+            
+            local average_damage = bot_count > 0 and (total_damage / bot_count) or 200
+            
+            -- Calculate required bots: ceil(target_health / average_damage) with 20% safety margin
+            local required_bots = math.ceil((party.target_health / average_damage) * 1.2)
+            
+            -- Count how many bots are already attacking (in approaching or exploding state, including scout)
+            local attacking_count = 0
+            for _, member in pairs(storage.creeperbots or {}) do
+                if member.party_id == creeper.party_id and 
+                   member.entity and member.entity.valid and
+                   (member.state == "approaching" or member.state == "exploding") and
+                   member.target and member.target.valid and
+                   member.target == target then
+                    attacking_count = attacking_count + 1
+                end
+            end
+            
+            -- Send more bots if needed (check every 30 ticks to avoid spam)
+            if not party.last_bot_send_tick or event.tick >= party.last_bot_send_tick + 30 then
+                local bots_to_send = required_bots - attacking_count
+                
+                if bots_to_send > 0 then
+                    -- Find available bots to send (excluding scout and leader)
+                    local available_bots = {}
+                    for _, member in ipairs(members) do
+                        if member.entity and member.entity.valid and 
+                           member.state == "preparing_to_attack" and 
+                           member.unit_number ~= party.scout_unit_number and
+                           not member.is_leader then
+                            table.insert(available_bots, member)
+                        end
+                    end
+                    
+                    -- Send bots up to the required count
+                    local sent_count = 0
+                    for _, bot in ipairs(available_bots) do
+                        if sent_count >= bots_to_send then break end
+                        
+                        -- Send bot to attack
+                        bot.target = target
+                        bot.target_position = target.position
+                        bot.target_health = target.health
+                        bot.preparing_to_attack_initialized = nil
+                        bot.entity.follow_target = nil
+                        bot.entity.autopilot_destination = nil
+                        bot.state = "approaching"
+                        update_color(bot.entity, "approaching")
+                        
+                        -- Path to target
+                        request_multiple_paths(bot.entity.position, target.position, party, surface, bot.unit_number)
+                        
+                        sent_count = sent_count + 1
+                    end
+                    
+                    party.last_bot_send_tick = event.tick
                 end
             end
         end
@@ -284,16 +432,18 @@ function preparing_to_attack_state.handle_preparing_to_attack_state(creeper, eve
     end
 
     -- ============================================
-    -- PHASE 3B: ASSIGN TARGETS AND PATH TO NESTS (After distractor sent + delay)
+    -- PHASE 3B: FALLBACK - SEND REMAINING BOTS (If target still alive after initial wave)
     -- ============================================
-    -- Assign targets to all bots except the active distractor (leader, former guards, and remaining distractors included)
-    -- Wait 120 ticks (2 seconds) after distractor is sent to give it time to run in
-    -- Exclude only the active distractor (in "distractor" state), not remaining distractors in "preparing_to_attack"
+    -- Only send remaining bots if target is still alive and we haven't sent enough
+    -- This is a fallback in case the calculation-based system didn't send enough bots
     if party.attack_initiated and 
        party.attack_start_tick and 
-       event.tick >= party.attack_start_tick + 120 and
-       creeper.state ~= "distractor" and  -- Exclude only the active distractor
-       (creeper.state == "preparing_to_attack" or creeper.state == "guard") then
+       party.target_nest and
+       party.target_nest.valid and
+       party.target_nest.health > 0 and
+       event.tick >= party.attack_start_tick + 180 and  -- Wait 3 seconds after scout
+       creeper.state == "preparing_to_attack" and
+       not creeper.is_leader then
        
         -- Re-get members list to ensure it's current
         -- Include all bots except the active distractor (in "distractor" state)
@@ -315,11 +465,16 @@ function preparing_to_attack_state.handle_preparing_to_attack_state(creeper, eve
             if target and target_type == "nest" then
                 party.target_nest = target
             else
-                -- No target, reform into formation (waking state)
+                -- No target - return to grouping state to rejoin party
                 creeper.target = nil
                 creeper.target_position = nil
                 creeper.target_health = nil
-                if party then party.shared_target = nil end
+                if party then 
+                    party.shared_target = nil
+                    party.target_nest = nil
+                    party.attack_initiated = false
+                    party.scout_sent = false
+                end
                 
                 -- Clear movement state
                 entity.follow_target = nil
@@ -328,12 +483,13 @@ function preparing_to_attack_state.handle_preparing_to_attack_state(creeper, eve
                     storage.scheduled_autopilots[entity.unit_number] = nil
                 end
                 
-                -- Reset waking state to start fresh
-                creeper.waking_initialized = nil
+                -- Reset grouping state to rejoin party
+                creeper.preparing_to_attack_initialized = nil
+                creeper.grouping_initialized = false
                 
-                -- Transition to waking state to reform
-                creeper.state = "waking"
-                update_color(entity, "waking")
+                -- Transition to grouping state to rejoin party
+                creeper.state = "grouping"
+                update_color(entity, "grouping")
                 return
             end
         end
@@ -389,6 +545,12 @@ function preparing_to_attack_state.handle_preparing_to_attack_state(creeper, eve
         -- Clear follow_target aggressively - this prevents weird movement
         entity.follow_target = nil
         entity.autopilot_destination = nil
+        -- Clear all autopilot destinations (autopilot_destinations is read-only, so we clear current destination repeatedly)
+        local attempts = 0
+        while entity.autopilot_destinations and #entity.autopilot_destinations > 0 and attempts < 20 do
+            entity.autopilot_destination = nil
+            attempts = attempts + 1
+        end
         if storage.scheduled_autopilots and storage.scheduled_autopilots[creeper.unit_number] then
             storage.scheduled_autopilots[creeper.unit_number] = nil
         end
@@ -406,6 +568,7 @@ function preparing_to_attack_state.handle_preparing_to_attack_state(creeper, eve
         creeper.target_position = assigned_target.position
         creeper.target_health = assigned_target.health
         creeper.assigned_target = assigned_target
+        creeper.preparing_to_attack_initialized = nil
         creeper.state = "approaching"
         update_color(entity, "approaching")
 

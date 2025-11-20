@@ -195,7 +195,7 @@ for _, config in pairs(creeperbot_configs) do
             enabled = false,
             energy_required = 5,
             ingredients = config.recipe_ingredients,
-            results = { { type = "item", name = config.name, amount = 2 } },
+            results = { { type = "item", name = config.name, amount = 1 } },
         }
 
         -- Extend prototypes

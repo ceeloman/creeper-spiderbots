@@ -174,8 +174,9 @@ function exploding_state.handle_exploding_state(creeper, event, position, entity
             -- No target found in search - re-validate existing target (it might have died during search)
             local has_valid_target = creeper.target and creeper.target.valid and creeper.target.health > 0
             if not has_valid_target then
-                -- No valid target exists - reform into formation (waking state)
-                -- Clear all attack-related data
+                -- No valid target exists
+                -- If guard was part of a party, return to grouping state to retake position
+                -- Otherwise, reform into formation (waking state)
                 creeper.target = nil
                 creeper.target_position = nil
                 creeper.target_health = nil
@@ -189,7 +190,16 @@ function exploding_state.handle_exploding_state(creeper, event, position, entity
                     storage.scheduled_autopilots[entity.unit_number] = nil
                 end
                 
-                -- Clear all grouping/party state to start fresh
+                -- If guard was part of a party, return to grouping to retake guard position
+                if creeper.party_id and party and party.state == "grouping" and creeper.is_guard then
+                    -- Reset grouping initialization so guard can retake position
+                    creeper.grouping_initialized = false
+                    creeper.state = "grouping"
+                    update_color(entity, "grouping")
+                    return false
+                end
+                
+                -- Otherwise, clear all grouping/party state to start fresh
                 creeper.grouping_initialized = false
                 creeper.party_id = nil
                 creeper.is_leader = false
@@ -211,7 +221,8 @@ function exploding_state.handle_exploding_state(creeper, event, position, entity
     -- Validate target again before using it (it might have died between initial check and now)
     -- This is critical - target could die at any time
     if not creeper.target or not creeper.target.valid or creeper.target.health <= 0 then
-        -- Target became invalid - transition to waking immediately
+        -- Target became invalid
+        -- If guard was part of a party, return to grouping state to retake position
         creeper.target = nil
         creeper.target_position = nil
         creeper.target_health = nil
@@ -225,7 +236,16 @@ function exploding_state.handle_exploding_state(creeper, event, position, entity
             storage.scheduled_autopilots[entity.unit_number] = nil
         end
         
-        -- Clear all grouping/party state to start fresh
+        -- If guard was part of a party, return to grouping to retake guard position
+        if creeper.party_id and party and party.state == "grouping" and creeper.is_guard then
+            -- Reset grouping initialization so guard can retake position
+            creeper.grouping_initialized = false
+            creeper.state = "grouping"
+            update_color(entity, "grouping")
+            return false
+        end
+        
+        -- Otherwise, clear all grouping/party state to start fresh
         creeper.grouping_initialized = false
         creeper.party_id = nil
         creeper.is_leader = false
@@ -247,7 +267,8 @@ function exploding_state.handle_exploding_state(creeper, event, position, entity
     
     -- Final validation - target might have died during position update
     if not creeper.target.valid or creeper.target.health <= 0 then
-        -- Target died during update - transition to waking
+        -- Target died during update
+        -- If guard was part of a party, return to grouping state to retake position
         creeper.target = nil
         creeper.target_position = nil
         creeper.target_health = nil
@@ -255,6 +276,17 @@ function exploding_state.handle_exploding_state(creeper, event, position, entity
         if storage.scheduled_autopilots and storage.scheduled_autopilots[entity.unit_number] then
             storage.scheduled_autopilots[entity.unit_number] = nil
         end
+        
+        -- If guard was part of a party, return to grouping to retake guard position
+        if creeper.party_id and party and party.state == "grouping" and creeper.is_guard then
+            -- Reset grouping initialization so guard can retake position
+            creeper.grouping_initialized = false
+            creeper.state = "grouping"
+            update_color(entity, "grouping")
+            return false
+        end
+        
+        -- Otherwise, clear all grouping/party state to start fresh
         creeper.grouping_initialized = false
         creeper.party_id = nil
         creeper.is_leader = false
@@ -338,11 +370,51 @@ function exploding_state.handle_exploding_state(creeper, event, position, entity
         local target_pos = creeper.target_position
         local dist_to_target = calculate_distance(position, target_pos)
         
-        -- If we're far away (> 20 tiles), use pathfinding
-        if dist_to_target > 20 then
-            if not creeper.last_path_request or event.tick >= creeper.last_path_request + 60 then
-                request_multiple_paths(position, target_pos, party, surface, creeper.unit_number)
-                creeper.last_path_request = event.tick
+        -- If we're far away (> 30 tiles), teleport toward target with random offset
+        if dist_to_target > 30 then
+            -- Check cooldown to prevent constant teleporting (every 60 ticks)
+            if not creeper.last_teleport_tick or event.tick >= creeper.last_teleport_tick + 60 then
+                -- Calculate landing position: random offset within 10 tiles of target
+                local random = game.create_random_generator()
+                local offset_radius = 3 + random() * 7  -- 3-10 tiles from target
+                local landing_pos = get_random_position_in_radius(target_pos, offset_radius)
+                
+                -- Find a safe non-colliding position near the landing point
+                local safe_landing_pos = surface.find_non_colliding_position("character", landing_pos, 20, 0.5)
+                if not safe_landing_pos then
+                    safe_landing_pos = landing_pos
+                end
+                
+                -- Clear movement state before teleporting (clear all autopilot destinations)
+                entity.autopilot_destination = nil
+                local attempts = 0
+                while entity.autopilot_destinations and #entity.autopilot_destinations > 0 and attempts < 20 do
+                    entity.autopilot_destination = nil
+                    attempts = attempts + 1
+                end
+                if storage.scheduled_autopilots and storage.scheduled_autopilots[entity.unit_number] then
+                    storage.scheduled_autopilots[entity.unit_number] = nil
+                end
+                
+                -- Teleport to landing position (target data is preserved in creeper, will be stored in teleport)
+                -- Note: We clear target AFTER teleportation so bot searches for new target near landing
+                create_creeperbot_projectile(position, safe_landing_pos, creeper, 3)
+                creeper.last_teleport_tick = event.tick
+                
+                -- Clear target AFTER storing in teleport data so bot will search for new target near landing position
+                creeper.target = nil
+                creeper.target_position = nil
+                creeper.target_health = nil
+                if party then party.shared_target = nil end
+                return true
+            else
+                -- On cooldown - use pathfinding as fallback
+                if not entity.autopilot_destination then
+                    if not creeper.last_path_request or event.tick >= creeper.last_path_request + 60 then
+                        request_multiple_paths(position, target_pos, party, surface, creeper.unit_number)
+                        creeper.last_path_request = event.tick
+                    end
+                end
             end
         elseif dist_to_target > explosion_distance then
             -- Close but not at explosion range - set autopilot directly to target position

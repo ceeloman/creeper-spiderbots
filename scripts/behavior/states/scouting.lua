@@ -2,6 +2,8 @@
 -- Extension mod based on SpiderBots © 2023-2025 by asher_sky (licensed under CC BY-NC-SA 4.0)
 -- This derivative work is also licensed under CC BY-NC-SA 4.0
 
+local config = require "scripts.behavior.config"
+
 local scouting_state = {}
 
 function scouting_state.handle_scouting_state(creeper, event, position, entity, party, has_valid_path)
@@ -123,7 +125,7 @@ function scouting_state.handle_scouting_state(creeper, event, position, entity, 
     end
     
     -- Show debug message above leader's head
-    if creeper.is_leader and entity.valid then
+    if creeper.unit_number == party.grouping_leader and entity.valid then
         -- Clear old debug text
         if creeper.debug_text_id then
             if type(creeper.debug_text_id) == "userdata" then
@@ -154,7 +156,7 @@ function scouting_state.handle_scouting_state(creeper, event, position, entity, 
         }
     end
 
-    if creeper.is_leader then
+    if creeper.unit_number == party.grouping_leader then
         local success, err = pcall(function()
             creeper.entity.follow_target = nil
         end)
@@ -165,6 +167,201 @@ function scouting_state.handle_scouting_state(creeper, event, position, entity, 
             --game.print("Debug: Leader " .. creeper.unit_number .. " follow_target set to nil, has path: " .. (has_valid_path and "yes" or "no"))
         end
     elseif creeper.is_guard then
+        -- Guards detect enemies and run towards them to explode
+        -- This uses guard-specific attack logic (stays in guard state, doesn't use approaching)
+        
+        -- Check if guard is currently attacking
+        if creeper.guard_target and creeper.guard_target.valid and creeper.guard_target.health > 0 then
+            -- Guard is attacking - handle attack behavior
+            local target = creeper.guard_target
+            local target_pos = target.position
+            local dist_to_target = calculate_distance(position, target_pos)
+            
+            -- Get tier config for explosion distance
+            local tier_config = config.tier_configs[entity.name] or config.tier_configs["creeperbot-mk1"]
+            local explosion_range = tier_config.radius or 3.5
+            local explosion_distance = 3  -- Reduced from 5 - explode sooner for nests
+            if target.type == "unit" or target.type == "turret" then
+                explosion_distance = 1.5  -- Reduced from 2 - explode sooner for units/turrets
+            end
+            
+            -- Close enough to explode
+            if dist_to_target <= explosion_distance then
+                -- Create explosion
+                if tier_config.explosion == "nuke-explosion" then
+                    surface.create_entity({name = "nuke-explosion", position = position})
+                    local cliffs = surface.find_entities_filtered{position = position, radius = 9, type = "cliff"}
+                    for _, cliff in pairs(cliffs) do
+                        cliff.destroy()
+                    end
+                    for _ = 1, 3 do
+                        surface.create_entity({name = "nuke-effects-nauvis", position = position})
+                    end
+                    if tier_config.extra_effect then
+                        surface.create_entity({name = tier_config.extra_effect, position = position})
+                    end
+                else
+                    surface.create_entity({name = tier_config.explosion, position = position})
+                end
+                
+                -- Damage nearby enemy entities
+                local nearby_entities = surface.find_entities_filtered{
+                    position = position,
+                    radius = explosion_range,
+                    force = "enemy"
+                }
+                for _, nearby_entity in pairs(nearby_entities) do
+                    if nearby_entity.valid and nearby_entity.health then
+                        nearby_entity.damage(tier_config.damage, "enemy", "explosion")
+                    end
+                end
+                
+                -- Destroy the bot
+                entity.die("enemy")
+                return
+            end
+            
+            -- Still too far - move towards target
+            entity.follow_target = nil
+            if not entity.autopilot_destination or (not creeper.guard_last_movement or event.tick >= creeper.guard_last_movement + 15) then
+                entity.autopilot_destination = nil
+                local success, err = pcall(function()
+                    entity.add_autopilot_destination(target_pos)
+                end)
+                if success then
+                    creeper.guard_last_movement = event.tick
+                end
+            end
+            
+            -- Update color to show guard is attacking
+            update_color(entity, "approaching")
+            return
+        else
+            -- No target or target is dead - guard survived attack, rejoin group
+            creeper.guard_target = nil
+            creeper.guard_target_position = nil
+            
+            -- Clear assignment in party
+            if party and party.guard_assignments then
+                for enemy_unit_number, guard_unit_number in pairs(party.guard_assignments) do
+                    if guard_unit_number == creeper.unit_number then
+                        party.guard_assignments[enemy_unit_number] = nil
+                        break
+                    end
+                end
+            end
+            
+            -- Guard automatically rejoins - will follow leader again
+            update_color(entity, "guard")
+            
+            -- Clear movement state to allow following leader
+            entity.follow_target = nil
+            entity.autopilot_destination = nil
+            if storage.scheduled_autopilots and storage.scheduled_autopilots[creeper.unit_number] then
+                storage.scheduled_autopilots[creeper.unit_number] = nil
+            end
+            
+            -- Check for new enemies to attack (only assign if enemy doesn't have a guard)
+            local nearby_enemies = surface.find_entities_filtered({
+                type = {"unit", "turret", "unit-spawner"},
+                position = position,
+                radius = 45,
+                force = "enemy"
+            })
+            
+            if #nearby_enemies > 0 and party then
+                -- Find enemies that don't have guards assigned
+                local unassigned_enemies = {}
+                for _, enemy in ipairs(nearby_enemies) do
+                    if enemy.valid and enemy.health > 0 then
+                        local has_guard = false
+                        if party.guard_assignments then
+                            for enemy_unit_number, guard_unit_number in pairs(party.guard_assignments) do
+                                if enemy_unit_number == enemy.unit_number then
+                                    local guard_creeper = storage.creeperbots[guard_unit_number]
+                                    if guard_creeper and guard_creeper.entity and guard_creeper.entity.valid and
+                                       guard_creeper.guard_target and guard_creeper.guard_target.valid then
+                                        has_guard = true
+                                        break
+                                    end
+                                end
+                            end
+                        end
+                        if not has_guard then
+                            table.insert(unassigned_enemies, enemy)
+                        end
+                    end
+                end
+                
+                if #unassigned_enemies > 0 then
+                    -- Find closest unassigned enemy
+                    local closest_enemy = nil
+                    local min_dist = math.huge
+                    for _, enemy in ipairs(unassigned_enemies) do
+                        local dist = calculate_distance(position, enemy.position)
+                        if dist < min_dist then
+                            min_dist = dist
+                            closest_enemy = enemy
+                        end
+                    end
+                    
+                    if closest_enemy then
+                        -- Get all available guards (not currently attacking)
+                        local available_guards = {}
+                        if party then
+                            for unit_number, member in pairs(storage.creeperbots or {}) do
+                                if member.party_id == creeper.party_id and 
+                                   member.is_guard and 
+                                   member.entity and 
+                                   member.entity.valid and
+                                   not member.guard_target then
+                                    table.insert(available_guards, member)
+                                end
+                            end
+                        end
+                        
+                        -- Find which guard is closest to the enemy
+                        local closest_guard = nil
+                        local closest_guard_dist = math.huge
+                        for _, guard in ipairs(available_guards) do
+                            if guard.entity and guard.entity.valid then
+                                local dist = calculate_distance(guard.entity.position, closest_enemy.position)
+                                if dist < closest_guard_dist then
+                                    closest_guard_dist = dist
+                                    closest_guard = guard
+                                end
+                            end
+                        end
+                        
+                        -- Only this guard attacks if it's the closest
+                        if closest_guard and closest_guard.unit_number == creeper.unit_number then
+                            -- This guard is closest - start attack (stay in guard state)
+                            creeper.guard_target = closest_enemy
+                            creeper.guard_target_position = closest_enemy.position
+                            
+                            -- Track assignment in party
+                            if party then
+                                party.guard_assignments = party.guard_assignments or {}
+                                party.guard_assignments[closest_enemy.unit_number] = creeper.unit_number
+                            end
+                            
+                            -- Clear follow_target so guard can move independently
+                            entity.follow_target = nil
+                            entity.autopilot_destination = nil
+                            if storage.scheduled_autopilots and storage.scheduled_autopilots[creeper.unit_number] then
+                                storage.scheduled_autopilots[creeper.unit_number] = nil
+                            end
+                            
+                            -- Update color to show guard is attacking
+                            update_color(entity, "approaching")
+                            return
+                        end
+                    end
+                end
+            end
+        end
+        
+        -- No enemies detected - continue following leader
         local guard_index = nil
         for i, guard in ipairs(guards) do
             if guard.unit_number == creeper.unit_number then

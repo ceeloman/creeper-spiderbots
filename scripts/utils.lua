@@ -105,6 +105,8 @@ function update_color(entity, state)
         entity.color = {r = 1, g = 1, b = 1} -- White
     elseif state == "grouping" then
         entity.color = {r = 0.5, g = 0.5, b = 0.5} -- Grey
+    elseif state == "defensive_formation" then
+        entity.color = {r = 1, g = 0.5, b = 0} -- Orange (distinct from grouping grey)
     elseif state == "scouting" then
         entity.color = {r = 0, g = 1, b = 0} -- Green
     elseif state == "approaching" then
@@ -260,6 +262,13 @@ function process_autopilot_queue(event)
                 -- Re-validate entity before accessing (could have become invalid)
                 if not (creeper and creeper.entity and creeper.entity.valid) then
                     storage.autopilot_queue[unit_number] = nil
+                -- Skip if in defensive_formation state (leader should stay stopped)
+                elseif creeper.state == "defensive_formation" then
+                    -- Remove from queue but don't apply
+                    table.remove(queue, next_index)
+                    if #queue == 0 then
+                        storage.autopilot_queue[unit_number] = nil
+                    end
                 else
                 -- If bot has a current destination, don't override it yet
                 if not creeper.entity.autopilot_destination then
@@ -423,8 +432,8 @@ function request_multiple_paths(position, target_pos, party, surface, creeper_un
 
     local path_collision_mask = {
         layers = {
-            water_tile = true,
-            cliff = true
+            water_tile = true
+            -- Removed cliff = true - allow pathing over straight cliffs
         },
         colliding_with_tiles_only = true,
         consider_tile_transitions = true

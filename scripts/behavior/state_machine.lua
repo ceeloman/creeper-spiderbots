@@ -4,6 +4,7 @@
 
 local waking_state = require "scripts.behavior.states.waking"
 local grouping_state = require "scripts.behavior.states.grouping"
+local defensive_formation_state = require "scripts.behavior.states.defensive_formation"
 local scouting_state = require "scripts.behavior.states.scouting"
 local approaching_state = require "scripts.behavior.states.approaching"
 local preparing_to_attack_state = require "scripts.behavior.states.preparing_to_attack"
@@ -57,6 +58,8 @@ function update_creeperbot(creeper, event)
         end
     elseif creeper.state == "grouping" then
         grouping_state.handle_grouping_state(creeper, event, position, entity, surface, tier, party)
+    elseif creeper.state == "defensive_formation" then
+        defensive_formation_state.handle_defensive_formation_state(creeper, event, position, entity, surface, tier, party)
     elseif creeper.state == "scouting" or creeper.state == "guard" and not creeper.is_leader then
         scouting_state.handle_scouting_state(creeper, event, position, entity, party)
     elseif creeper.state == "scouting" and creeper.is_leader then

@@ -2,6 +2,8 @@
 -- Extension mod based on SpiderBots © 2023-2025 by asher_sky (licensed under CC BY-NC-SA 4.0)
 -- This derivative work is also licensed under CC BY-NC-SA 4.0
 
+local config = require "scripts.behavior.config"
+
 local grouping_state = {}
 
 function grouping_state.handle_grouping_state(creeper, event, position, entity, surface, tier, party)
@@ -71,102 +73,282 @@ function grouping_state.handle_grouping_state(creeper, event, position, entity, 
         return
     end
     
-    -- Guard distraction behavior - guards detect bugs and distract them
-    if creeper.is_guard then
-        -- Check for nearby enemy units within 20 tiles
+    -- Guard behavior - guards detect bugs and run towards them to explode
+    -- This is separate from regular approaching logic - guards stay in grouping state
+    -- Check for enemies and assign guards only when needed
+    if creeper.is_guard and not creeper.guard_target then
+        -- Guard is not attacking - check for enemies that need guards
         local nearby_enemies = surface.find_entities_filtered({
-            type = "unit",
+            type = {"unit", "turret", "unit-spawner"},
             position = position,
-            radius = 20,
+            radius = 30,
             force = "enemy"
         })
         
-        if #nearby_enemies > 0 then
-            -- Find closest enemy
-            local closest_enemy = nil
-            local min_dist = math.huge
+        if #nearby_enemies > 0 and party then
+            -- Find enemies that don't have guards assigned
+            local unassigned_enemies = {}
             for _, enemy in ipairs(nearby_enemies) do
                 if enemy.valid and enemy.health > 0 then
-                    local dist = calculate_distance(position, enemy.position)
-                    if dist < min_dist then
-                        min_dist = dist
-                        closest_enemy = enemy
+                    local has_guard = false
+                    if party.guard_assignments then
+                        for enemy_unit_number, guard_unit_number in pairs(party.guard_assignments) do
+                            if enemy_unit_number == enemy.unit_number then
+                                local guard_creeper = storage.creeperbots[guard_unit_number]
+                                if guard_creeper and guard_creeper.entity and guard_creeper.entity.valid and
+                                   guard_creeper.guard_target and guard_creeper.guard_target.valid then
+                                    has_guard = true
+                                    break
+                                end
+                            end
+                        end
+                    end
+                    if not has_guard then
+                        table.insert(unassigned_enemies, enemy)
                     end
                 end
             end
             
-            if closest_enemy then
-                -- Initialize distraction state if not set
-                if not creeper.distraction_state then
-                    creeper.distraction_state = "approaching"  -- approaching, distracting, exploding
-                    creeper.distraction_target = closest_enemy
-                    creeper.distraction_start_tick = event.tick
+            if #unassigned_enemies > 0 then
+                -- Find closest unassigned enemy
+                local closest_enemy = nil
+                local min_dist = math.huge
+                for _, enemy in ipairs(unassigned_enemies) do
+                    local dist = calculate_distance(position, enemy.position)
+                    if dist < min_dist then
+                        min_dist = dist
+                        closest_enemy = enemy
                 end
-                
-                local dist_to_enemy = calculate_distance(position, closest_enemy.position)
-                
-                if creeper.distraction_state == "approaching" then
-                    -- Run towards enemy until within 10 tiles
-                    if dist_to_enemy > 10 then
-                        -- Move towards enemy
-                        local dx = closest_enemy.position.x - position.x
-                        local dy = closest_enemy.position.y - position.y
-                        local distance = math.sqrt(dx * dx + dy * dy)
-                        local dir_x = dx / distance
-                        local dir_y = dy / distance
+            end
+            
+            if closest_enemy then
+                    -- Get all available guards (not currently attacking)
+                    local available_guards = {}
+                    if party then
+                        for unit_number, member in pairs(storage.creeperbots or {}) do
+                            if member.party_id == creeper.party_id and 
+                               member.is_guard and 
+                               member.entity and 
+                               member.entity.valid and
+                               (member.state == "grouping" or member.state == "guard") and
+                               not member.guard_target then
+                                table.insert(available_guards, member)
+                            end
+                        end
+                    end
+                    
+                    -- Find which guard is closest to the enemy
+                    local closest_guard = nil
+                    local closest_guard_dist = math.huge
+                    for _, guard in ipairs(available_guards) do
+                        if guard.entity and guard.entity.valid then
+                            local dist = calculate_distance(guard.entity.position, closest_enemy.position)
+                            if dist < closest_guard_dist then
+                                closest_guard_dist = dist
+                                closest_guard = guard
+                            end
+                        end
+                    end
+                    
+                    -- Only this guard attacks if it's the closest
+                    if closest_guard and closest_guard.unit_number == creeper.unit_number then
+                        -- This guard is closest - start attack (stay in grouping state)
+                        creeper.guard_target = closest_enemy
+                        creeper.guard_target_position = closest_enemy.position
                         
-                        local next_pos = {
-                            x = position.x + dir_x * 5,
-                            y = position.y + dir_y * 5
-                        }
-                        entity.autopilot_destination = nil
-                        local success, err = pcall(function()
-                            entity.add_autopilot_destination(next_pos)
-                        end)
-                    else
-                        -- Close enough, start distracting
-                        creeper.distraction_state = "distracting"
-                        local random = game.create_random_generator()
-                        creeper.distraction_direction = random(1, 2) == 1 and "left" or "right"
-                        creeper.distraction_last_change = event.tick
-                    end
-                elseif creeper.distraction_state == "distracting" then
-                    -- Move left/right perpendicular to enemy direction
-                    local dx = closest_enemy.position.x - position.x
-                    local dy = closest_enemy.position.y - position.y
-                    local angle = math.atan2(dy, dx)
-                    
-                    -- Perpendicular direction (left or right)
-                    local perp_angle = angle + (creeper.distraction_direction == "left" and -math.pi/2 or math.pi/2)
-                    
-                    -- Change direction every 60 ticks
-                    if event.tick >= (creeper.distraction_last_change or 0) + 60 then
-                        creeper.distraction_direction = creeper.distraction_direction == "left" and "right" or "left"
-                        creeper.distraction_last_change = event.tick
-                    end
-                    
-                    local move_pos = {
-                        x = position.x + math.cos(perp_angle) * 3,
-                        y = position.y + math.sin(perp_angle) * 3
-                    }
+                        -- Track assignment in party
+                        if party then
+                            party.guard_assignments = party.guard_assignments or {}
+                            party.guard_assignments[closest_enemy.unit_number] = creeper.unit_number
+                        end
+                        
+                        -- Reset grouping timer to 5 seconds (300 ticks) when guard attacks
+                        -- Set start tick so that 5 seconds (300 ticks) remain
+                        -- Calculate min_time based on current party members
+                        if party and party.grouping_start_tick then
+                            -- Get member count for min_time calculation
+                            local member_count = 0
+                            if party then
+                                for unit_number, member in pairs(storage.creeperbots or {}) do
+                                    if member.party_id == creeper.party_id and member.entity and member.entity.valid then
+                                        member_count = member_count + 1
+                                    end
+                                end
+                            end
+                            local min_time = (member_count >= 3) and 600 or 900
+                            party.grouping_start_tick = event.tick - (min_time - 300)
+                        end
+                        
+                        -- Clear follow_target and movement so guard can move independently
+                        entity.follow_target = nil
                     entity.autopilot_destination = nil
-                    local success, err = pcall(function()
-                        entity.add_autopilot_destination(move_pos)
-                    end)
-                    
-                    -- Check if enemy is very close - explode
-                    -- Units need to be within 2 tiles, nests would be 5 tiles (but guards only target units)
-                    local explode_distance = 2  -- Guards only target units
-                    if dist_to_enemy <= explode_distance then
-                        creeper.distraction_state = "exploding"
-                        creeper.target = closest_enemy
-                        creeper.target_position = closest_enemy.position
-                        creeper.state = "exploding"
-                        update_color(entity, "exploding")
+                        if storage.scheduled_autopilots and storage.scheduled_autopilots[creeper.unit_number] then
+                            storage.scheduled_autopilots[creeper.unit_number] = nil
+                        end
+                        
+                        -- Update color to show guard is attacking
+                        update_color(entity, "approaching")
                         return
                     end
                 end
             end
+        end
+    end
+    
+    -- Guard behavior - guards detect bugs and run towards them to explode
+    -- This is separate from regular approaching logic - guards stay in grouping state
+    if creeper.is_guard then
+        -- Check if guard is currently attacking (has a target)
+        -- First validate target - if invalid or dead, clear it immediately
+        if creeper.guard_target then
+            if not creeper.guard_target.valid or not creeper.guard_target.health or creeper.guard_target.health <= 0 then
+                -- Target is dead or invalid - clear it immediately
+                creeper.guard_target = nil
+                creeper.guard_target_position = nil
+                if party and party.guard_assignments then
+                    for enemy_unit_number, guard_unit_number in pairs(party.guard_assignments) do
+                        if guard_unit_number == creeper.unit_number then
+                            party.guard_assignments[enemy_unit_number] = nil
+                            break
+                        end
+                    end
+                end
+                creeper.grouping_initialized = false
+                update_color(entity, "guard")
+            end
+        end
+        
+        if creeper.guard_target and creeper.guard_target.valid and creeper.guard_target.health and creeper.guard_target.health > 0 then
+            -- Guard is attacking - handle attack behavior
+            local target = creeper.guard_target
+            local target_pos = target.position
+            local dist_to_target = calculate_distance(position, target_pos)
+            
+            -- Get tier config for explosion distance
+            local tier_config = config.tier_configs[entity.name] or config.tier_configs["creeperbot-mk1"]
+            local explosion_range = tier_config.radius or 3.5
+            local explosion_distance = 3  -- Reduced from 5 - explode sooner for nests
+            if target.type == "unit" or target.type == "turret" then
+                explosion_distance = 1.5  -- Reduced from 2 - explode sooner for units/turrets
+            end
+            
+            -- Close enough to explode
+            if dist_to_target <= explosion_distance then
+                -- Create explosion
+                if tier_config.explosion == "nuke-explosion" then
+                    surface.create_entity({name = "nuke-explosion", position = position})
+                    local cliffs = surface.find_entities_filtered{position = position, radius = 9, type = "cliff"}
+                    for _, cliff in pairs(cliffs) do
+                        cliff.destroy()
+                    end
+                    for _ = 1, 3 do
+                        surface.create_entity({name = "nuke-effects-nauvis", position = position})
+                    end
+                    if tier_config.extra_effect then
+                        surface.create_entity({name = tier_config.extra_effect, position = position})
+                    end
+                else
+                    surface.create_entity({name = tier_config.explosion, position = position})
+                end
+                
+                -- Damage nearby enemy entities
+                local nearby_entities = surface.find_entities_filtered{
+                    position = position,
+                    radius = explosion_range,
+                    force = "enemy"
+                }
+                for _, nearby_entity in pairs(nearby_entities) do
+                    if nearby_entity.valid and nearby_entity.health then
+                        nearby_entity.damage(tier_config.damage, "enemy", "explosion")
+                    end
+                end
+                
+                -- Destroy the bot
+                entity.die("enemy")
+                return
+            end
+            
+            -- Still too far - move towards target
+            entity.follow_target = nil
+            if not entity.autopilot_destination or (not creeper.guard_last_movement or event.tick >= creeper.guard_last_movement + 15) then
+                entity.autopilot_destination = nil
+                local success, err = pcall(function()
+                    entity.add_autopilot_destination(target_pos)
+                end)
+                if success then
+                    creeper.guard_last_movement = event.tick
+                end
+            end
+            
+            -- Update color to show guard is attacking
+            update_color(entity, "approaching")
+            return
+        else
+            -- No target or target is dead - guard survived attack, rejoin group
+            creeper.guard_target = nil
+            creeper.guard_target_position = nil
+            
+            -- Clear assignment in party
+            if party and party.guard_assignments then
+                for enemy_unit_number, guard_unit_number in pairs(party.guard_assignments) do
+                    if guard_unit_number == creeper.unit_number then
+                        party.guard_assignments[enemy_unit_number] = nil
+                        break
+                    end
+                end
+            end
+            
+            -- Check if there are too many guards - if so, this guard should stand down
+            -- Get all members to count guards
+            local all_members = {}
+            if party then
+                for unit_number, member in pairs(storage.creeperbots or {}) do
+                    if member.party_id == creeper.party_id and member.entity and member.entity.valid then
+                        table.insert(all_members, member)
+                    end
+                end
+            end
+            
+            local required_guard_count = 0
+            if #all_members >= 6 then required_guard_count = 5
+            elseif #all_members >= 5 then required_guard_count = 4
+            elseif #all_members >= 4 then required_guard_count = 3
+            elseif #all_members >= 3 then required_guard_count = 2
+            elseif #all_members >= 2 then required_guard_count = 1
+            end
+            
+            -- Count current guards (excluding this one, and excluding guards that are attacking)
+            local current_guard_count = 0
+            for _, member in ipairs(all_members) do
+                if member.is_guard and 
+                   member.unit_number ~= creeper.unit_number and
+                   member.entity and 
+                   member.entity.valid and
+                   (not member.guard_target or not member.guard_target.valid or not member.guard_target.health or member.guard_target.health <= 0) then
+                    current_guard_count = current_guard_count + 1
+                end
+            end
+            
+            -- If we already have enough guards, this returning guard should stand down
+            if current_guard_count >= required_guard_count then
+                -- Too many guards - stand down
+                creeper.is_guard = false
+                update_color(entity, "grouping")
+                creeper.grouping_initialized = false
+            else
+                -- Guard automatically rejoins - reset initialization so guard can retake position
+                creeper.grouping_initialized = false
+                update_color(entity, "guard")
+            end
+            
+            -- Clear movement state to allow repositioning
+            entity.follow_target = nil
+            entity.autopilot_destination = nil
+            if storage.scheduled_autopilots and storage.scheduled_autopilots[creeper.unit_number] then
+                storage.scheduled_autopilots[creeper.unit_number] = nil
+            end
+            
+            -- Guard will be positioned in guard positioning logic below (if still a guard)
         end
     end
 
@@ -195,14 +377,17 @@ function grouping_state.handle_grouping_state(creeper, event, position, entity, 
             storage.parties[party_id] = party
             creeper.party_id = party_id
         else
-            -- Bot is joining an existing party - reset the grouping timer so countdown starts fresh
-            party.grouping_start_tick = event.tick
+            -- Bot is joining an existing party - don't reset timer, let countdown continue
+            -- Only set last_join_tick to track when members join
             party.last_join_tick = event.tick
         end
         creeper.is_leader = not party.grouping_leader and true or false
         if creeper.is_leader then
             party.grouping_leader = entity.unit_number
+            -- Only set timer if not already set (first leader)
+            if not party.grouping_start_tick then
             party.grouping_start_tick = event.tick
+            end
             party.last_join_tick = event.tick
         end
         creeper.grouping_initialized = true
@@ -227,7 +412,10 @@ function grouping_state.handle_grouping_state(creeper, event, position, entity, 
         creeper.is_guard = false
         update_color(entity, "grouping")
         party.grouping_leader = entity.unit_number
+        -- Only set timer if not already set (don't reset if timer was already running)
+        if not party.grouping_start_tick then
         party.grouping_start_tick = event.tick
+        end
         party.last_join_tick = event.tick
         leader_pos = entity.position
         --game.print("Debug: Leader invalid, unit " .. creeper.unit_number .. " became leader")
@@ -258,7 +446,23 @@ function grouping_state.handle_grouping_state(creeper, event, position, entity, 
     elseif #members >= 3 then required_guard_count = 2
     elseif #members >= 2 then required_guard_count = 1
     end
-    local current_guards = #guards
+    
+    -- Count guards that are in grouping state and not currently attacking
+    -- Guards that are attacking (have guard_target) don't count toward required guard count
+    local active_guards = {}
+    local attacking_guards = {}
+    for _, member in ipairs(members) do
+        if member.is_guard and (member.state == "grouping" or member.state == "guard") then
+            if member.guard_target and member.guard_target.valid and member.guard_target.health > 0 then
+                -- Guard is currently attacking
+                table.insert(attacking_guards, member)
+            else
+                -- Guard is available (not attacking)
+                table.insert(active_guards, member)
+            end
+        end
+    end
+    local current_guards = #active_guards
 
     if current_guards < required_guard_count then
         local candidates = {}
@@ -274,7 +478,7 @@ function grouping_state.handle_grouping_state(creeper, event, position, entity, 
                 candidate.is_guard = true
                 update_color(candidate.entity, "guard")
                 current_guards = current_guards + 1
-                table.insert(guards, candidate)
+                table.insert(active_guards, candidate)
                 -- Force guard to take position immediately by clearing any existing destinations
                 if candidate.entity and candidate.entity.valid then
                     candidate.entity.autopilot_destination = nil
@@ -298,14 +502,15 @@ function grouping_state.handle_grouping_state(creeper, event, position, entity, 
             table.sort(new_members, function(a, b) return a.tier < b.tier end)
             
             for _, new_member in ipairs(new_members) do
-                for i = #guards, 1, -1 do
-                    local guard = guards[i]
-                    if guard.tier > new_member.tier then
+                for i = #active_guards, 1, -1 do
+                    local guard = active_guards[i]
+                    -- Only swap if guard is in grouping state (not returning from attack)
+                    if guard.state == "grouping" and guard.tier > new_member.tier then
                         guard.is_guard = false
                         update_color(guard.entity, "grouping")
                         new_member.is_guard = true
                         update_color(new_member.entity, "guard")
-                        guards[i] = new_member
+                        active_guards[i] = new_member
                         -- Force newly assigned guard to take position immediately
                         if new_member.entity and new_member.entity.valid then
                             new_member.entity.autopilot_destination = nil
@@ -324,10 +529,15 @@ function grouping_state.handle_grouping_state(creeper, event, position, entity, 
     end
     
     -- Rebuild guards array after assignment to ensure all guards are included
+    -- Use active_guards if it exists (from promotion logic), otherwise build from members
+    if active_guards and #active_guards > 0 then
+        guards = active_guards
+    else
     guards = {}
     for _, member in ipairs(members) do
-        if member.is_guard then
+            if member.is_guard and (member.state == "grouping" or member.state == "guard") then
             table.insert(guards, member)
+            end
         end
     end
 
@@ -348,6 +558,12 @@ function grouping_state.handle_grouping_state(creeper, event, position, entity, 
     if actual_guard_count > 0 then
         for i, guard in ipairs(guards) do
             if guard.entity and guard.entity.valid then
+                -- Skip positioning if guard is currently attacking
+                if guard.guard_target and guard.guard_target.valid and guard.guard_target.health > 0 then
+                    -- Guard is attacking, skip positioning
+                    goto continue_guard
+                end
+                
                 local pos = guard_positions[i] or {angle = 180, radius = 3}
                 local dest_pos = {
                     x = math.floor(leader_pos.x + math.cos(math.rad(pos.angle)) * pos.radius),
@@ -356,7 +572,9 @@ function grouping_state.handle_grouping_state(creeper, event, position, entity, 
                 local dist_to_current = math.sqrt((dest_pos.x - guard.entity.position.x)^2 + (dest_pos.y - guard.entity.position.y)^2)
                 -- Only move if significantly out of position (> 1.5 tiles) to prevent micro-movements
                 -- And ensure we don't spam path requests
-                local can_move = (not guard.last_path_request or guard.last_path_request == 0 or event.tick >= guard.last_path_request + 120)
+                -- For guards returning from attack (just initialized grouping), always check positioning
+                local is_returning_guard = not guard.grouping_initialized and guard.is_guard
+                local can_move = is_returning_guard or (not guard.last_path_request or guard.last_path_request == 0 or event.tick >= guard.last_path_request + 120)
                 if dist_to_current > 1.5 and can_move then
                     -- Check if guard is already moving toward destination (including scheduled autopilots)
                     local queue = storage.scheduled_autopilots and storage.scheduled_autopilots[guard.unit_number]
@@ -364,8 +582,10 @@ function grouping_state.handle_grouping_state(creeper, event, position, entity, 
                     -- Only skip if there's an active destination OR a scheduled one that hasn't expired yet
                     if queue and event.tick < queue.tick then
                         -- Has a scheduled destination that hasn't been applied yet, skip
-                    elseif not has_active_destination then
-                        -- No active destination, set it directly (like distraction behavior does)
+                    elseif not has_active_destination or is_returning_guard then
+                        -- No active destination, or guard is returning from attack - set it directly
+                        -- Clear follow_target if set (guards returning from attack might have it set)
+                        guard.entity.follow_target = nil
                         guard.entity.autopilot_destination = nil  -- Clear first
                         local success, err = pcall(function()
                             guard.entity.add_autopilot_destination(dest_pos)
@@ -373,6 +593,7 @@ function grouping_state.handle_grouping_state(creeper, event, position, entity, 
                         guard.last_path_request = event.tick
                     end
                 end
+                ::continue_guard::
             end
         end
     end
@@ -525,17 +746,16 @@ function grouping_state.handle_grouping_state(creeper, event, position, entity, 
         end
     end
 
-    -- Reset grouping_start_tick when new members join (so timer starts fresh when party is ready)
-    if party.last_join_tick and party.last_join_tick > (party.grouping_start_tick or 0) then
-        -- New member joined after timer started - reset timer
-        party.grouping_start_tick = event.tick
-    elseif not party.grouping_start_tick then
-        -- First time - set grouping_start_tick
+    -- Initialize grouping_start_tick if not set (first time only)
+    if not party.grouping_start_tick then
         party.grouping_start_tick = event.tick
     end
     
+    -- Don't reset timer when new members join - let countdown continue
+    -- This allows the group to move out even if members join late
+    
     -- Fallback: If bot has been in grouping for 60+ seconds and still can't transition, go solo
-    local time_elapsed = event.tick - party.grouping_start_tick
+    local time_elapsed = event.tick - (party.grouping_start_tick or event.tick)
     if time_elapsed >= 3600 and not party.started_scouting and #members == 1 then
         -- Bot is stuck solo in grouping - go to scouting
         party.started_scouting = true
@@ -577,8 +797,10 @@ function grouping_state.handle_grouping_state(creeper, event, position, entity, 
         end
         
         -- Create new debug text
+        -- Recalculate time_elapsed for debug display (before guards_attacking check)
+        local debug_time_elapsed = event.tick - (party.grouping_start_tick or event.tick)
         local min_time = (#members >= 3) and 600 or 900
-        local time_remaining = math.max(0, min_time - time_elapsed)
+        local time_remaining = math.max(0, min_time - debug_time_elapsed)
         local debug_msg = string.format("Grouping: %d members, %ds left", #members, math.ceil(time_remaining / 60))
         
         creeper.debug_text_id = rendering.draw_text{
@@ -592,12 +814,62 @@ function grouping_state.handle_grouping_state(creeper, event, position, entity, 
         }
     end
     
+    -- Check if any guards are currently attacking - if so, pause countdown
+    -- Only count guards that have a valid, alive target
+    -- Also proactively clear dead targets to ensure accurate detection
+    local guards_attacking = false
+    local had_guards_attacking = party and party.guards_were_attacking or false
+    if party then
+        for unit_number, member in pairs(storage.creeperbots or {}) do
+            if member.party_id == creeper.party_id and 
+               member.is_guard and 
+               member.entity and 
+               member.entity.valid then
+                -- Check if guard has a valid, alive target
+                if member.guard_target then
+                    -- Validate target - clear if dead or invalid
+                    if not member.guard_target.valid or not member.guard_target.health or member.guard_target.health <= 0 then
+                        -- Target is dead or invalid - clear it immediately
+                        member.guard_target = nil
+                        member.guard_target_position = nil
+                        if party.guard_assignments then
+                            for enemy_unit_number, guard_unit_number in pairs(party.guard_assignments) do
+                                if guard_unit_number == member.unit_number then
+                                    party.guard_assignments[enemy_unit_number] = nil
+                                    break
+                                end
+                            end
+                        end
+                        -- Don't count as attacking
+                    elseif member.guard_target.valid and member.guard_target.health and member.guard_target.health > 0 then
+                        guards_attacking = true
+                        -- Only reset timer when guards START attacking (not every tick)
+                        -- The timer reset is already handled when the guard is assigned (line ~165)
+                        -- So we don't need to reset it here again
+                        break
+                    end
+                end
+            end
+        end
+        -- Track whether guards were attacking for next tick
+        party.guards_were_attacking = guards_attacking
+    end
+    
+    -- Recalculate time_elapsed after potentially resetting timer
+    time_elapsed = event.tick - (party.grouping_start_tick or event.tick)
+    
     -- Transition to scouting after timeout (reduced from 1200 to 600 ticks = 10 seconds)
     -- Also allow transition with fewer members (at least 1, or wait longer if solo)
+    -- Don't transition if guards are attacking - wait until safe
     local min_time = (#members >= 3) and 600 or 900  -- 10 seconds for groups, 15 seconds for smaller groups
     local has_leader = party.grouping_leader and storage.creeperbots[party.grouping_leader] and storage.creeperbots[party.grouping_leader].entity and storage.creeperbots[party.grouping_leader].entity.valid
     
-    if not party.started_scouting and party.grouping_start_tick and time_elapsed >= min_time and has_leader and #members >= 1 then
+    if not party.started_scouting and 
+       party.grouping_start_tick and 
+       not guards_attacking and
+       time_elapsed >= min_time and 
+       has_leader and 
+       #members >= 1 then
         -- Clear debug text
         if creeper.is_leader and creeper.debug_text_id then
             if type(creeper.debug_text_id) == "userdata" then

@@ -50,7 +50,7 @@ function scan_for_enemies(position, surface, max_targeting, waking)
 
     -- If an enemy unit is found, return it
     if nearest_unit then
-        --game.print("Found enemy unit at (" .. nearest_unit.position.x .. "," .. nearest_unit.position.y .. "), distance: " .. nearest_unit_distance)
+        game.print("Found enemy unit at (" .. nearest_unit.position.x .. "," .. nearest_unit.position.y .. "), distance: " .. nearest_unit_distance)
         return nearest_unit, "unit"
     end
 

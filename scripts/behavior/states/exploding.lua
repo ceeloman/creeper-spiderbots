@@ -298,22 +298,23 @@ function exploding_state.handle_exploding_state(creeper, event, position, entity
         return false
     end
 
-    -- Calculate distance to target (using validated target_position)
+    -- IMMEDIATELY check distance and explode if within range (before any movement logic)
+    -- Calculate distance to target using fresh position
     local dist_to_target = calculate_distance(position, creeper.target_position)
     local explosion_range = tier.radius or 3.5
     
     -- Explosion distance depends on target type:
     -- Nests have large radius, bots can't get to center - use 5 tiles
-    -- Turrets and units are smaller - use 2 tiles
+    -- Turrets and units are smaller - use 1.5 tiles (reduced for faster explosion)
     local explosion_distance = 5  -- Default for nests
     if creeper.target and creeper.target.valid then
         if creeper.target.type == "unit" or creeper.target.type == "turret" then
-            explosion_distance = 2  -- Units and turrets need to be closer
+            explosion_distance = 1.5  -- Units and turrets - reduced for immediate explosion
         end
         -- Nests use default 5 tiles
     end
 
-    -- Close enough to explode
+    -- Close enough to explode - check immediately and explode right away
     if dist_to_target <= explosion_distance then
         -- Create explosion
         if tier.explosion == "nuke-explosion" then
@@ -370,55 +371,81 @@ function exploding_state.handle_exploding_state(creeper, event, position, entity
         local target_pos = creeper.target_position
         local dist_to_target = calculate_distance(position, target_pos)
         
-        -- If we're far away (> 30 tiles), teleport toward target with random offset
-        if dist_to_target > 30 then
-            -- Check cooldown to prevent constant teleporting (every 60 ticks)
-            if not creeper.last_teleport_tick or event.tick >= creeper.last_teleport_tick + 60 then
-                -- Calculate landing position: random offset within 10 tiles of target
-                local random = game.create_random_generator()
-                local offset_radius = 3 + random() * 7  -- 3-10 tiles from target
-                local landing_pos = get_random_position_in_radius(target_pos, offset_radius)
-                
-                -- Find a safe non-colliding position near the landing point
-                local safe_landing_pos = surface.find_non_colliding_position("character", landing_pos, 20, 0.5)
-                if not safe_landing_pos then
-                    safe_landing_pos = landing_pos
-                end
-                
-                -- Clear movement state before teleporting (clear all autopilot destinations)
-                entity.autopilot_destination = nil
-                local attempts = 0
-                while entity.autopilot_destinations and #entity.autopilot_destinations > 0 and attempts < 20 do
-                    entity.autopilot_destination = nil
-                    attempts = attempts + 1
-                end
-                if storage.scheduled_autopilots and storage.scheduled_autopilots[entity.unit_number] then
-                    storage.scheduled_autopilots[entity.unit_number] = nil
-                end
-                
-                -- Teleport to landing position (target data is preserved in creeper, will be stored in teleport)
-                -- Note: We clear target AFTER teleportation so bot searches for new target near landing
-                create_creeperbot_projectile(position, safe_landing_pos, creeper, 3)
-                creeper.last_teleport_tick = event.tick
-                
-                -- Clear target AFTER storing in teleport data so bot will search for new target near landing position
-                creeper.target = nil
-                creeper.target_position = nil
-                creeper.target_health = nil
-                if party then party.shared_target = nil end
-                return true
-            else
-                -- On cooldown - use pathfinding as fallback
-                if not entity.autopilot_destination then
-                    if not creeper.last_path_request or event.tick >= creeper.last_path_request + 60 then
-                        request_multiple_paths(position, target_pos, party, surface, creeper.unit_number)
-                        creeper.last_path_request = event.tick
-                    end
-                end
+        -- Launch/teleport logic with cooldown (same as approaching state)
+        -- Launch cooldown: 4 seconds (240 ticks)
+        local launch_cooldown = 240
+        
+        -- Track if we've launched for THIS specific target (not globally)
+        local target_id = creeper.target and creeper.target.valid and creeper.target.unit_number or nil
+        local has_launched_for_this_target = false
+        if target_id and creeper.launched_targets then
+            has_launched_for_this_target = creeper.launched_targets[target_id] == true
+        end
+        
+        local cooldown_expired = true  -- Default to true if never launched
+        if creeper.last_teleport_tick then
+            cooldown_expired = event.tick >= creeper.last_teleport_tick + launch_cooldown
+        end
+        
+        -- Check if we should launch
+        -- Initial launch for THIS target: must be within 45 tiles (but not too close to explode) AND cooldown expired
+        -- Subsequent launches for same target: must be >20 tiles away and cooldown MUST be expired
+        local should_launch = false
+        if not has_launched_for_this_target then
+            -- First launch for this target - only if within 45 tiles, not too close to explode, and cooldown expired
+            should_launch = dist_to_target <= 45 and dist_to_target > explosion_distance and cooldown_expired
+        else
+            -- Subsequent launches for same target - >20 tiles away and cooldown MUST be expired
+            should_launch = dist_to_target > 20 and cooldown_expired
+        end
+        
+        if should_launch then
+            -- Calculate landing position: random offset within 10 tiles of target
+            local random = game.create_random_generator()
+            local offset_radius = 3 + random() * 7  -- 3-10 tiles from target
+            local landing_pos = get_random_position_in_radius(target_pos, offset_radius)
+            
+            -- Find a safe non-colliding position near the landing point
+            local safe_landing_pos = surface.find_non_colliding_position("character", landing_pos, 20, 0.5)
+            if not safe_landing_pos then
+                safe_landing_pos = landing_pos
             end
-        elseif dist_to_target > explosion_distance then
-            -- Close but not at explosion range - set autopilot directly to target position
-            -- Update movement every 15 ticks or if no autopilot destination
+            
+            -- Clear movement state before teleporting (clear all autopilot destinations)
+            entity.autopilot_destination = nil
+            local attempts = 0
+            while entity.autopilot_destinations and #entity.autopilot_destinations > 0 and attempts < 20 do
+                entity.autopilot_destination = nil
+                attempts = attempts + 1
+            end
+            if storage.scheduled_autopilots and storage.scheduled_autopilots[entity.unit_number] then
+                storage.scheduled_autopilots[entity.unit_number] = nil
+            end
+            
+            -- Set teleport cooldown BEFORE creating projectile (so it's stored in teleport data)
+            creeper.last_teleport_tick = event.tick
+            
+            -- Mark that we've launched for this target
+            if target_id then
+                creeper.launched_targets = creeper.launched_targets or {}
+                creeper.launched_targets[target_id] = true
+            end
+            
+            -- Teleport to landing position (target data is preserved in creeper, will be stored in teleport)
+            -- Note: We clear target AFTER teleportation so bot searches for new target near landing
+            create_creeperbot_projectile(position, safe_landing_pos, creeper, 3)
+            
+            -- Clear target AFTER storing in teleport data so bot will search for new target near landing position
+            creeper.target = nil
+            creeper.target_position = nil
+            creeper.target_health = nil
+            creeper.search_radius = nil  -- Reset search radius after launch
+            if party then party.shared_target = nil end
+            return true
+        end
+        
+        -- If within 20 tiles or on cooldown, use autopilot to move toward target
+        if dist_to_target > explosion_distance then
             if not entity.autopilot_destination or (not creeper.last_movement_update or event.tick >= creeper.last_movement_update + 15) then
                 -- Clear existing autopilot and add new destination directly to target
                 entity.autopilot_destination = nil

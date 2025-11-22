@@ -141,43 +141,6 @@ function defensive_formation_state.handle_defensive_formation_state(creeper, eve
     local formation_time_elapsed = event.tick - party.defensive_formation_start_tick
     local formation_wait_time = 60  -- Wait 60 ticks before assuming guard positions
     
-    -- SIMPLIFIED: Just check if enemies are cleared - return to scouting when all dead
-    -- Scan within 60 tiles of leader
-    local nearby_enemies = surface.find_entities_filtered({
-        type = {"unit", "turret", "unit-spawner"},
-        position = leader_pos,
-        radius = 60,  -- Check within 60 tiles of leader
-        force = "enemy"
-    })
-    
-    -- Only count enemies that are actually alive (valid and health > 0)
-    local active_enemies = {}
-    for _, enemy in ipairs(nearby_enemies) do
-        if enemy.valid and enemy.health > 0 then
-            table.insert(active_enemies, enemy)
-        end
-    end
-    
-    -- COMMENTED OUT FOR TESTING: Don't return to scouting, just stay in defensive formation
-    --[[
-    -- If no active enemies (all dead), return to scouting
-    if #active_enemies == 0 then
-        game.print("DEBUG: No active enemies (all dead), returning to scouting")
-        party.state = "scouting"
-        party.defensive_formation = false
-        party.last_defensive_scan_tick = nil
-        for _, member in ipairs(members) do
-            if member.state == "defensive_formation" then
-                member.state = "scouting"
-                update_color(member.entity, member.is_guard and "guard" or "scouting")
-                -- Clear defensive targets
-                member.defensive_target = nil
-            end
-        end
-        return
-    end
-    --]]
-    
     -- Handle defensive_target attack movement (for bots assigned to attack units)
     if creeper.defensive_target then
         -- CRITICAL: Clear follow_target aggressively - bot is attacking, should NOT follow anyone
@@ -253,7 +216,6 @@ function defensive_formation_state.handle_defensive_formation_state(creeper, eve
         if current_guard_count < required_guard_count then
             creeper.is_guard = true
             update_color(entity, "guard")
-            game.print("DEBUG: Returning attacker " .. creeper.unit_number .. " promoted to guard")
         end
     end
     
@@ -270,58 +232,130 @@ function defensive_formation_state.handle_defensive_formation_state(creeper, eve
     local current_guard_count = 0
     local active_guards = {}
 
-    -- First, show ALL members that are marked as guards (before filtering)
-    game.print("DEBUG: Checking all members marked as guards:")
-    for _, member in ipairs(members) do
-        if member and member.is_guard then
-            local has_entity = member.entity ~= nil
-            local entity_valid = has_entity and member.entity.valid or false
-            local has_defensive_target = member.defensive_target ~= nil
-            game.print("DEBUG: Guard " .. member.unit_number .. " | has_entity: " .. tostring(has_entity) .. " | entity_valid: " .. tostring(entity_valid) .. " | has_defensive_target: " .. tostring(has_defensive_target))
-        end
-    end
-
-    -- Now build the active_guards list (only guards that pass all criteria)
+    -- Build the active_guards list (only guards that pass all criteria)
     for _, member in ipairs(members) do
         if member.is_guard and member.entity and member.entity.valid and not member.defensive_target then
             current_guard_count = current_guard_count + 1
             table.insert(active_guards, member)
-            game.print("DEBUG: Active guard " .. member.unit_number .. " (current guard count: " .. current_guard_count .. ")")
         end
     end
     
     -- If too many guards, demote the lowest tier guard
-    game.print("DEBUG: Guard count check - current_guard_count: " .. current_guard_count .. ", required_guard_count: " .. required_guard_count)
     if current_guard_count > required_guard_count then
-        game.print("DEBUG: Too many guards, demoting excess guards")
         -- Sort guards by tier (lowest first)
         table.sort(active_guards, function(a, b) return a.tier < b.tier end)
         -- Demote excess guards (starting with lowest tier)
         local excess = current_guard_count - required_guard_count
-        game.print("DEBUG: Demoting " .. excess .. " guards (excess)")
         for i = 1, excess do
             if active_guards[i] then
-                game.print("DEBUG: Demoting guard " .. active_guards[i].unit_number .. " (tier: " .. active_guards[i].tier .. ")")
                 active_guards[i].is_guard = false
                 update_color(active_guards[i].entity, "defensive_formation")
-                game.print("DEBUG: Demoted guard " .. active_guards[i].unit_number .. " (too many guards)")
             end
         end
-    else
-        game.print("DEBUG: Guard count OK - not demoting any guards")
+    end
+    
+    local actual_guard_count = #active_guards
+    
+    -- Check if enemies are cleared and guards are in position - return to scouting
+    -- Only check if we're past the wait period (guards should be in position)
+    if formation_time_elapsed >= formation_wait_time then
+        -- Scan within 60 tiles of leader
+        local nearby_enemies = surface.find_entities_filtered({
+            type = {"unit", "turret", "unit-spawner"},
+            position = leader_pos,
+            radius = 60,
+            force = "enemy"
+        })
+        
+        -- Only count enemies that are actually alive (valid and health > 0)
+        local active_enemies = {}
+        for _, enemy in ipairs(nearby_enemies) do
+            if enemy.valid and enemy.health > 0 then
+                table.insert(active_enemies, enemy)
+            end
+        end
+        
+        -- If no active enemies, check if guards are in position before transitioning
+        if #active_enemies == 0 then
+            local guards_in_position = true
+            if actual_guard_count > 0 then
+                for _, guard in ipairs(active_guards) do
+                    if guard.entity and guard.entity.valid and not guard.defensive_target then
+                        -- Calculate guard's expected position
+                        local guard_index = nil
+                        for i, g in ipairs(active_guards) do
+                            if g.unit_number == guard.unit_number then
+                                guard_index = i
+                                break
+                            end
+                        end
+                        if guard_index then
+                            local guard_positions = {}
+                            if actual_guard_count == 1 then
+                                guard_positions = {{angle = 180, radius = 3}}
+                            elseif actual_guard_count == 2 then
+                                guard_positions = {{angle = 90, radius = 4}, {angle = 270, radius = 4}}
+                            elseif actual_guard_count == 3 then
+                                guard_positions = {{angle = 120, radius = 5}, {angle = 240, radius = 5}, {angle = 0, radius = 5}}
+                            elseif actual_guard_count == 4 then
+                                guard_positions = {{angle = 45, radius = 6}, {angle = 135, radius = 6}, {angle = 225, radius = 6}, {angle = 315, radius = 6}}
+                            elseif actual_guard_count >= 5 then
+                                guard_positions = {{angle = 0, radius = 8}, {angle = 72, radius = 8}, {angle = 144, radius = 8}, {angle = 216, radius = 8}, {angle = 288, radius = 8}}
+                            end
+                            local pos = guard_positions[guard_index] or {angle = 180, radius = 3}
+                            local dest_pos = {
+                                x = math.floor(leader_pos.x + math.cos(math.rad(pos.angle)) * pos.radius),
+                                y = math.floor(leader_pos.y + math.sin(math.rad(pos.angle)) * pos.radius)
+                            }
+                            local dist_to_position = math.sqrt((dest_pos.x - guard.entity.position.x)^2 + (dest_pos.y - guard.entity.position.y)^2)
+                            if dist_to_position > 2.0 then
+                                guards_in_position = false
+                                break
+                            end
+                        end
+                    end
+                end
+            end
+            
+            -- If all enemies are dead and guards are in position, transition to scouting
+            if guards_in_position then
+                party.state = "scouting"
+                party.defensive_formation = false
+                party.last_defensive_scan_tick = nil
+                party.defensive_formation_start_tick = nil
+                party.started_scouting = true
+                party.follower_targets = party.follower_targets or {}
+                
+                -- Transition all members to scouting (similar to grouping state)
+                for unit_number, member in pairs(storage.creeperbots or {}) do
+                    if member.party_id == creeper.party_id and member.entity and member.entity.valid then
+                        if member.state == "defensive_formation" or member.state == "guard" then
+                            member.state = member.is_guard and "guard" or "scouting"
+                            update_color(member.entity, member.state)
+                            -- Clear defensive targets
+                            member.defensive_target = nil
+                        end
+                    end
+                end
+                
+                -- Set leader path to unvisited chunk (similar to grouping state)
+                if creeper.is_leader or (party and creeper.unit_number == party.grouping_leader) then
+                    entity.autopilot_destination = nil
+                    local target_pos = get_unvisited_chunk(entity.position, party)
+                    if target_pos.x ~= entity.position.x or target_pos.y ~= entity.position.y then
+                        request_multiple_paths(entity.position, target_pos, party, surface, creeper.unit_number)
+                    end
+                end
+                
+                return
+            end
+        end
     end
     
     -- All non-leader, non-attacking bots should follow the leader (during wait period)
     if not creeper.is_leader and not creeper.defensive_target and leader.entity and leader.entity.valid then
         -- During wait period (first 60 ticks), all bots follow leader
         if formation_time_elapsed < formation_wait_time then
-            if creeper.is_guard then
-                local guard_ids = {}
-                for i, guard in ipairs(active_guards) do
-                    table.insert(guard_ids, tostring(guard.unit_number))
-                end
-                game.print("DEBUG: WAIT PERIOD - Guard " .. creeper.unit_number .. " following leader (elapsed: " .. formation_time_elapsed .. "/" .. formation_wait_time .. ") | Active guards: " .. #active_guards .. " | IDs: [" .. table.concat(guard_ids, ", ") .. "]")
-            end
             -- Clear autopilot destinations first
             entity.autopilot_destination = nil
             -- Clear all autopilot destinations
@@ -340,50 +374,11 @@ function defensive_formation_state.handle_defensive_formation_state(creeper, eve
                 entity.follow_target = leader.entity
             end)
             if not success then
-                game.print("DEBUG: Failed to set follow_target for unit " .. creeper.unit_number .. ": " .. tostring(err))
+                -- Failed to set follow_target, continue anyway
             end
         else
             -- After wait period, guards take positions, followers continue following
-            -- Log all party members and their is_guard status BEFORE the guard check
-            game.print("DEBUG: AFTER WAIT PERIOD - Checking all party members for is_guard status:")
-            game.print("DEBUG: required_guard_count: " .. required_guard_count)
-            local guards_still_active = 0
-            local guards_in_defensive_formation = 0
-            for _, member in ipairs(members) do
-                if member then
-                    local is_guard_status = member.is_guard or false
-                    local is_in_defensive_formation = (member.state == "defensive_formation")
-                    if is_guard_status then
-                        guards_still_active = guards_still_active + 1
-                        if is_in_defensive_formation then
-                            guards_in_defensive_formation = guards_in_defensive_formation + 1
-                        end
-                    end
-                    local has_entity = member.entity ~= nil
-                    local entity_valid = has_entity and member.entity.valid or false
-                    local has_defensive_target = member.defensive_target ~= nil
-                    -- Only log guards to reduce spam
-                    if is_guard_status then
-                        game.print("DEBUG: Guard " .. member.unit_number .. " | is_guard: " .. tostring(is_guard_status) .. " | state: " .. tostring(member.state) .. " | in_defensive_formation: " .. tostring(is_in_defensive_formation) .. " | has_entity: " .. tostring(has_entity) .. " | entity_valid: " .. tostring(entity_valid) .. " | has_defensive_target: " .. tostring(has_defensive_target))
-                    end
-                end
-            end
-            game.print("DEBUG: Total guards still active: " .. guards_still_active)
-            game.print("DEBUG: Guards in defensive_formation state: " .. guards_in_defensive_formation)
-            game.print("DEBUG: Current creeper " .. creeper.unit_number .. " | is_guard: " .. tostring(creeper.is_guard) .. " | state: " .. tostring(creeper.state))
-            
             if creeper.is_guard then
-                game.print("DEBUG: STAGE 1 - Guard " .. creeper.unit_number .. " entering positioning phase")
-                
-                -- First, list all members with is_guard flag
-                local guard_ids = {}
-                for _, member in ipairs(members) do
-                    if member and member.is_guard then
-                        table.insert(guard_ids, tostring(member.unit_number))
-                    end
-                end
-                game.print("DEBUG: Members with is_guard=true: [" .. table.concat(guard_ids, ", ") .. "] (count: " .. #guard_ids .. ")")
-                
                 -- Guard positioning after wait period (similar to grouping state)
                 local guards = {}
                 for _, member in ipairs(members) do
@@ -391,14 +386,6 @@ function defensive_formation_state.handle_defensive_formation_state(creeper, eve
                         table.insert(guards, member)
                     end
                 end
-                
-                -- List guard IDs that passed all criteria
-                local passed_guard_ids = {}
-                for _, guard in ipairs(guards) do
-                    table.insert(passed_guard_ids, tostring(guard.unit_number))
-                end
-                game.print("DEBUG: Guards that passed criteria: [" .. table.concat(passed_guard_ids, ", ") .. "] (count: " .. #guards .. ")")
-                game.print("DEBUG: STAGE 2 - Guard " .. creeper.unit_number .. " found " .. #guards .. " total guards")
                 
                 local guard_positions = {}
                 local actual_guard_count = #guards
@@ -415,13 +402,11 @@ function defensive_formation_state.handle_defensive_formation_state(creeper, eve
                 end
                 
                 if actual_guard_count > 0 then
-                    game.print("DEBUG: STAGE 3 - Guard " .. creeper.unit_number .. " checking for guard index")
                     -- Find this guard's index
                     local guard_index = nil
                     for i, guard in ipairs(guards) do
                         if guard.unit_number == creeper.unit_number then
                             guard_index = i
-                            game.print("DEBUG: STAGE 3 SUCCESS - Guard " .. creeper.unit_number .. " found at index " .. guard_index)
                             break
                         end
                     end
@@ -434,22 +419,16 @@ function defensive_formation_state.handle_defensive_formation_state(creeper, eve
                         }
                         local dist_to_current = math.sqrt((dest_pos.x - entity.position.x)^2 + (dest_pos.y - entity.position.y)^2)
                         
-                        game.print("DEBUG: STAGE 4 - Guard " .. creeper.unit_number .. " calculating position (dist: " .. string.format("%.1f", dist_to_current) .. ")")
                         -- CRITICAL: ALWAYS clear follow_target when entering positioning phase (guards were following leader during wait period)
                         -- This must happen for ALL guards, not just ones that need to move
                         if entity.follow_target then
-                            game.print("DEBUG: STAGE 4a - Guard " .. creeper.unit_number .. " clearing follow_target (was: " .. tostring(entity.follow_target ~= nil) .. ")")
                             for i = 1, 5 do
                                 pcall(function() entity.follow_target = nil end)
                             end
-                            game.print("DEBUG: STAGE 4a - Guard " .. creeper.unit_number .. " follow_target cleared (now: " .. tostring(entity.follow_target ~= nil) .. ")")
-                        else
-                            game.print("DEBUG: STAGE 4a - Guard " .. creeper.unit_number .. " no follow_target to clear")
                         end
                         
                         -- Clear autopilot destinations if they exist
                         if entity.autopilot_destination or (#entity.autopilot_destinations > 0) then
-                            game.print("DEBUG: STAGE 4b - Guard " .. creeper.unit_number .. " clearing autopilot destinations")
                             entity.autopilot_destination = nil
                             -- Clear scheduled autopilots and queue
                             if storage.scheduled_autopilots and storage.scheduled_autopilots[creeper.unit_number] then
@@ -458,62 +437,36 @@ function defensive_formation_state.handle_defensive_formation_state(creeper, eve
                             if storage.autopilot_queue and storage.autopilot_queue[creeper.unit_number] then
                                 storage.autopilot_queue[creeper.unit_number] = nil
                             end
-                            game.print("DEBUG: STAGE 4b - Guard " .. creeper.unit_number .. " cleared movement targets")
-                        else
-                            game.print("DEBUG: STAGE 4b - Guard " .. creeper.unit_number .. " no autopilot destinations to clear")
                         end
                         
                         -- Early return if already in position and all movement targets cleared
                         if dist_to_current <= 1.5 and not entity.follow_target and not entity.autopilot_destination and (#entity.autopilot_destinations == 0) then
-                            game.print("DEBUG: STAGE 4c - Guard " .. creeper.unit_number .. " already in position, skipping movement")
                             return
                         end
-                        
-                        game.print("DEBUG: STAGE 5 - Guard " .. creeper.unit_number .. " dist to position: " .. string.format("%.1f", dist_to_current))
                         
                         -- Only move if significantly out of position (> 1.5 tiles) to prevent micro-movements
                         -- Throttle movement requests (similar to grouping state)
                         local can_move = not creeper.last_path_request or creeper.last_path_request == 0 or event.tick >= creeper.last_path_request + 120
-                        game.print("DEBUG: STAGE 6 - Guard " .. creeper.unit_number .. " can_move: " .. tostring(can_move) .. " (last_path_request: " .. tostring(creeper.last_path_request) .. ", tick: " .. event.tick .. ")")
                         
                         if dist_to_current > 1.5 then
-                            game.print("DEBUG: STAGE 7 - Guard " .. creeper.unit_number .. " needs to move (dist > 1.5)")
                             if can_move then
-                                game.print("DEBUG: STAGE 7a - Guard " .. creeper.unit_number .. " can move, checking for active destinations")
                                 -- Check if guard is already moving toward destination
                                 local queue = storage.scheduled_autopilots and storage.scheduled_autopilots[creeper.unit_number]
                                 local has_active_destination = entity.autopilot_destination ~= nil or (#entity.autopilot_destinations > 0)
-                                game.print("DEBUG: STAGE 7b - Guard " .. creeper.unit_number .. " has_active_destination: " .. tostring(has_active_destination) .. ", queue: " .. tostring(queue ~= nil))
                                 
                                 -- Only set destination if not already moving or scheduled
-                                if queue and event.tick < queue.tick then
-                                    game.print("DEBUG: STAGE 7c - Guard " .. creeper.unit_number .. " has scheduled destination, skipping")
-                                elseif not has_active_destination then
-                                    game.print("DEBUG: STAGE 7d - Guard " .. creeper.unit_number .. " setting destination to (" .. dest_pos.x .. "," .. dest_pos.y .. ")")
+                                if not (queue and event.tick < queue.tick) and not has_active_destination then
                                     -- Set destination
                                     local success, err = pcall(function()
                                         entity.add_autopilot_destination(dest_pos)
                                     end)
                                     if success then
                                         creeper.last_path_request = event.tick
-                                        game.print("DEBUG: STAGE 7e SUCCESS - Guard " .. creeper.unit_number .. " destination set")
-                                    else
-                                        game.print("DEBUG: STAGE 7e FAILED - Guard " .. creeper.unit_number .. " failed to set destination: " .. tostring(err))
                                     end
-                                else
-                                    game.print("DEBUG: STAGE 7c - Guard " .. creeper.unit_number .. " already has active destination, skipping")
                                 end
-                            else
-                                game.print("DEBUG: STAGE 7a FAILED - Guard " .. creeper.unit_number .. " cannot move (throttled)")
                             end
-                        else
-                            game.print("DEBUG: STAGE 7 - Guard " .. creeper.unit_number .. " already in position (dist <= 1.5)")
                         end
-                    else
-                        game.print("DEBUG: STAGE 3 FAILED - Guard " .. creeper.unit_number .. " not found in guards list (count: " .. actual_guard_count .. ")")
                     end
-                else
-                    game.print("DEBUG: STAGE 2 FAILED - Guard " .. creeper.unit_number .. " no guards found (actual_guard_count: 0)")
                 end
             else
                 -- Follower continues following leader after wait period
@@ -535,14 +488,15 @@ function defensive_formation_state.handle_defensive_formation_state(creeper, eve
                     entity.follow_target = leader.entity
                 end)
                 if not success then
-                    game.print("DEBUG: Failed to set follow_target for unit " .. creeper.unit_number .. ": " .. tostring(err))
+                    -- Failed to set follow_target, continue anyway
                 end
             end
         end
     end
-    
-    -- COMMENTED OUT: All complex enemy assignment and attack logic
-    --[[
+end
+
+-- COMMENTED OUT: All complex enemy assignment and attack logic
+--[[
     -- Periodic scanning for enemies (every 60 ticks, only by leader)
     local should_scan = false
     local is_leader = creeper.is_leader or (party and creeper.unit_number == party.grouping_leader)
@@ -837,6 +791,5 @@ function defensive_formation_state.handle_defensive_formation_state(creeper, eve
     end
     
 --]]
-end
 
 return defensive_formation_state

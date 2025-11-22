@@ -470,7 +470,39 @@ function waypoints.process_waypoints(creeper)
             
             if target then
                 if target_type == "nest" then
+                    -- Check if this nest was recently rejected (too many waypoints)
+                    local nest_key = string.format("%.1f,%.1f", target.position.x, target.position.y)
+                    if party then
+                        party.rejected_nests = party.rejected_nests or {}
+                    end
+                    local rejected_nests = party and party.rejected_nests or {}
+                    local rejection_cooldown = 3000  -- 50 seconds at 60 ticks/sec
+                    local was_rejected = false
+                    local rejection_time = rejected_nests[nest_key]
+                    
+                    if rejection_time and (game.tick - rejection_time) < rejection_cooldown then
+                        was_rejected = true
+                        log("Nest detected at (" .. string.format("%.1f", target.position.x) .. ", " .. string.format("%.1f", target.position.y) .. ") but was recently rejected (too many waypoints), ignoring for " .. math.ceil((rejection_cooldown - (game.tick - rejection_time)) / 60) .. " more seconds")
+                    else
+                        -- Clear old rejection if cooldown expired
+                        if rejection_time and party then
+                            party.rejected_nests[nest_key] = nil
+                        end
+                    end
+                    
+                    if was_rejected then
+                        -- Don't transition, continue scouting
+                        return false
+                    end
+                    
                     -- Nests trigger preparing_to_attack
+                    log("Nest detected at (" .. string.format("%.1f", target.position.x) .. ", " .. string.format("%.1f", target.position.y) .. ") by leader " .. creeper.unit_number .. ", transitioning party to preparing_to_attack")
+                    
+                    -- Update party state to preparing_to_attack
+                    if party then
+                        party.state = "preparing_to_attack"
+                    end
+                    
                     -- Mark chunks within view distance as unsafe when enemies are detected
                     if creeper.is_leader and party then
                         local current_chunk_pos = get_chunk_pos(current_destination)
@@ -479,6 +511,7 @@ function waypoints.process_waypoints(creeper)
                     end
                     
                     --game.print("Debug: Leader " .. creeper.unit_number .. " detected nest at (" .. target.position.x .. "," .. target.position.y .. "), transitioning party to preparing_to_attack, tick: " .. game.tick)
+                    local transitioned_count = 0
                     for unit_number, member in pairs(storage.creeperbots or {}) do
                         if member.party_id == creeper.party_id and member.entity and member.entity.valid then
                             -- Don't transition bots that are already in defensive attack
@@ -492,10 +525,18 @@ function waypoints.process_waypoints(creeper)
                                     storage.scheduled_autopilots[unit_number] = nil
                                     --game.print("Debug: Cleared scheduled autopilot for unit " .. unit_number .. ", tick: " .. game.tick)
                                 end
+                                transitioned_count = transitioned_count + 1
                                --game.print("Debug: Unit " .. unit_number .. " transitioned to preparing_to_attack, tick: " .. game.tick)
                             end
                         end
                     end
+                    
+                    if transitioned_count == 0 then
+                        log("WARNING: Nest detected but NO bots transitioned to preparing_to_attack! Leader: " .. creeper.unit_number .. ", party_id: " .. (creeper.party_id or "nil"))
+                    else
+                        log("Successfully transitioned " .. transitioned_count .. " bots to preparing_to_attack for nest at (" .. string.format("%.1f", target.position.x) .. ", " .. string.format("%.1f", target.position.y) .. ")")
+                    end
+                    
                     return false
                 elseif target_type == "unit" then
                     game.print("DEBUG: Waypoints detected UNIT at waypoint, leader=" .. creeper.unit_number)
@@ -642,20 +683,19 @@ function waypoints.process_waypoints(creeper)
                                     local needed = required_bots - attacking_count
                                     game.print("DEBUG: Need to assign " .. needed .. " more bots")
                                     
-                                    -- Get available bots (not currently attacking anything, EXCLUDE LEADER)
+                                    -- Get available bots (not currently attacking anything, including leader)
                                     local available_bots = {}
                                     for unit_number, member in pairs(storage.creeperbots or {}) do
                                         if member.party_id == creeper.party_id and 
                                            member.entity and 
                                            member.entity.valid and
-                                           not member.is_leader and  -- EXCLUDE LEADER - leader stays in formation
                                            not member.defensive_target and
                                            not member.target and  -- Don't assign if already approaching a nest
                                            not member.guard_target then
                                             table.insert(available_bots, member)
                                         end
                                     end
-                                    game.print("DEBUG: Found " .. #available_bots .. " available bots to assign (leader excluded)")
+                                    game.print("DEBUG: Found " .. #available_bots .. " available bots to assign (including leader)")
                                     
                                     -- Sort by distance to enemy
                                     table.sort(available_bots, function(a, b)
@@ -666,33 +706,37 @@ function waypoints.process_waypoints(creeper)
                                         return dist_a < dist_b
                                     end)
                                     
-                                    -- Assign closest bots
+                                    -- Assign closest bots (only if within 30 tiles of target)
                                     local assigned_count = 0
                                     for i = 1, math.min(needed, #available_bots) do
                                         local bot = available_bots[i]
-                                        bot.defensive_target = enemy
-                                        bot.defensive_target_position = enemy.position
-                                        
-                                        -- Clear follow_target and autopilot so bot can move independently to attack
-                                        -- Clear follow_target multiple times aggressively
-                                        for i = 1, 5 do
-                                            pcall(function() bot.entity.follow_target = nil end)
-                                        end
-                                        bot.entity.autopilot_destination = nil
-                                        -- Clear all autopilot destinations
-                                        local attempts = 0
-                                        while bot.entity.autopilot_destinations and #bot.entity.autopilot_destinations > 0 and attempts < 20 do
+                                        -- Check distance to target - only assign if within 30 tiles
+                                        local bot_dist_to_enemy = calculate_distance(bot.entity.position, enemy.position)
+                                        if bot_dist_to_enemy <= 30 then
+                                            bot.defensive_target = enemy
+                                            bot.defensive_target_position = enemy.position
+                                            
+                                            -- Clear follow_target and autopilot so bot can move independently to attack
+                                            -- Clear follow_target multiple times aggressively
+                                            for i = 1, 5 do
+                                                pcall(function() bot.entity.follow_target = nil end)
+                                            end
                                             bot.entity.autopilot_destination = nil
-                                            attempts = attempts + 1
+                                            -- Clear all autopilot destinations
+                                            local attempts = 0
+                                            while bot.entity.autopilot_destinations and #bot.entity.autopilot_destinations > 0 and attempts < 20 do
+                                                bot.entity.autopilot_destination = nil
+                                                attempts = attempts + 1
+                                            end
+                                            if storage.scheduled_autopilots and storage.scheduled_autopilots[bot.unit_number] then
+                                                storage.scheduled_autopilots[bot.unit_number] = nil
+                                            end
+                                            
+                                            -- Update color to show bot is attacking
+                                            update_color(bot.entity, "approaching")
+                                            assigned_count = assigned_count + 1
+                                            game.print("DEBUG: Assigned bot " .. bot.unit_number .. " to enemy " .. enemy.unit_number)
                                         end
-                                        if storage.scheduled_autopilots and storage.scheduled_autopilots[bot.unit_number] then
-                                            storage.scheduled_autopilots[bot.unit_number] = nil
-                                        end
-                                        
-                                        -- Update color to show bot is attacking
-                                        update_color(bot.entity, "approaching")
-                                        assigned_count = assigned_count + 1
-                                        game.print("DEBUG: Assigned bot " .. bot.unit_number .. " to enemy " .. enemy.unit_number)
                                     end
                                     game.print("DEBUG: Total assigned: " .. assigned_count .. " bots to enemy " .. enemy.unit_number)
                                 else

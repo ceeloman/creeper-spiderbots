@@ -128,6 +128,7 @@ local function handle_trigger_created_entity(event)
             last_target_search = best_match.last_target_search,  -- Restore target search timing
             last_health = best_match.last_health,  -- Restore health tracking
             max_health = best_match.max_health,  -- Restore max health
+            launched_targets = best_match.launched_targets,  -- Restore launch tracking per target
             waking_initialized = best_match.waking_initialized,  -- Restore waking state
             grouping_initialized = best_match.grouping_initialized,  -- Restore grouping state
             distract_start_tick = best_match.distract_start_tick,  -- Restore distractor timing
@@ -236,6 +237,7 @@ function create_creeperbot_projectile(origin, destination, creeper, speed_multip
         last_target_search = creeper.last_target_search,
         last_health = creeper.last_health,
         max_health = creeper.max_health,
+        launched_targets = creeper.launched_targets,  -- Preserve launch tracking per target
         waking_initialized = creeper.waking_initialized,
         grouping_initialized = creeper.grouping_initialized,
         distract_start_tick = creeper.distract_start_tick,
@@ -893,7 +895,10 @@ local function handle_path_request(event)
             log("Path request " .. event.id .. " failed, will retry later")
             local surface = creeper.entity.surface
             local path_collision_mask = {
-                layers = { water_tile = true },  -- Removed cliff = true
+                layers = { 
+                    water_tile = true,
+                    cliff = true  -- Prefer avoiding cliffs in pathfinding
+                },
                 colliding_with_tiles_only = true,
                 consider_tile_transitions = true
             }
@@ -931,7 +936,14 @@ local function handle_path_request(event)
             storage.path_requests[event.id] = nil
             return
         else
-            log("Path request " .. event.id .. " failed permanently")
+            -- Check if this is a scouting path failure
+            if (creeper.state == "scouting" or (party and party.state == "scouting")) and request.target_pos then
+                log("Scouting path failed permanently for unit " .. (creeper.unit_number or "unknown") .. 
+                    " to (" .. string.format("%.1f", request.target_pos.x) .. ", " .. string.format("%.1f", request.target_pos.y) .. ")" ..
+                    ", request_id: " .. event.id)
+            else
+                log("Path request " .. event.id .. " failed permanently")
+            end
             if not is_distractor then
                 creeper.state = "scouting"
                 creeper.target = nil
@@ -951,16 +963,19 @@ local function handle_path_request(event)
         log("Cleared follow_target for unit " .. request.creeper_unit_number .. " before setting autopilot path")
     end
     
-    -- Filter out water waypoints and ensure first waypoint is safe
+    -- Filter out water waypoints and cliff-problematic waypoints
     local surface = creeper.entity.surface
     local safe_waypoints = {}
     local skipped_water = 0
+    local skipped_cliffs = 0
     
-    for _, waypoint in ipairs(event.path) do
+    for i, waypoint in ipairs(event.path) do
+        local waypoint_pos = waypoint.position
+        local prev_pos = (i > 1) and event.path[i-1].position or creeper.entity.position
+        local next_pos = (i < #event.path) and event.path[i+1].position or nil
+        
         -- Check if waypoint is on water
-        if not is_position_on_water(surface, waypoint.position, 1.5) then
-            table.insert(safe_waypoints, waypoint.position)
-        else
+        if is_position_on_water(surface, waypoint_pos, 1.5) then
             skipped_water = skipped_water + 1
             -- If this is the first waypoint and it's in water, try to find a safe alternative
             if #safe_waypoints == 0 then
@@ -971,6 +986,21 @@ local function handle_path_request(event)
                     log("First waypoint was in water, using safe alternative at (" .. string.format("%.1f", safe_pos.x) .. ", " .. string.format("%.1f", safe_pos.y) .. ")")
                 end
             end
+        -- Check if waypoint is near a corner cliff (avoid)
+        elseif is_position_near_corner_cliff(surface, waypoint_pos, 2.5) then
+            skipped_cliffs = skipped_cliffs + 1
+            -- Skip corner cliff waypoints
+        -- Check if waypoint path is parallel to a cliff (avoid)
+        elseif is_waypoint_parallel_to_cliff(surface, waypoint_pos, prev_pos, next_pos, 2.0) then
+            skipped_cliffs = skipped_cliffs + 1
+            -- Skip parallel cliff paths
+        -- Allow waypoints that cross straight cliffs (2-3 cliffs in a line)
+        elseif is_waypoint_crossing_straight_cliff(surface, waypoint_pos, prev_pos, next_pos, 2.5) then
+            -- This is OK - straight cliffs are easy to traverse
+            table.insert(safe_waypoints, waypoint_pos)
+        -- No cliff issues, add waypoint
+        else
+            table.insert(safe_waypoints, waypoint_pos)
         end
     end
     
@@ -980,7 +1010,7 @@ local function handle_path_request(event)
         local safe_pos = find_safe_position_away_from_water(surface, creeper.entity, request.target_pos, 30)
         if safe_pos then
             table.insert(safe_waypoints, safe_pos)
-            log("All waypoints were in water, using safe alternative target at (" .. string.format("%.1f", safe_pos.x) .. ", " .. string.format("%.1f", safe_pos.y) .. ")")
+            log("All waypoints were problematic, using safe alternative target at (" .. string.format("%.1f", safe_pos.x) .. ", " .. string.format("%.1f", safe_pos.y) .. ")")
         else
             log("Warning: Could not find safe waypoints for unit " .. request.creeper_unit_number)
             storage.path_requests[event.id] = nil
@@ -988,13 +1018,122 @@ local function handle_path_request(event)
         end
     end
     
+    -- Check if path has too many waypoints (likely going around a large obstacle like a lake)
+    local MAX_WAYPOINTS = 75
+    if #safe_waypoints > MAX_WAYPOINTS then
+        log("Path rejected: too many waypoints (" .. #safe_waypoints .. ") for unit " .. request.creeper_unit_number .. " to (" .. string.format("%.1f", request.target_pos.x) .. ", " .. string.format("%.1f", request.target_pos.y) .. ")")
+        
+        -- Check if this is a path to a nest target (nest on other side of lake - not a threat)
+        local is_nest_target = false
+        if party and party.target_nest and party.target_nest.valid then
+            local nest_pos = party.target_nest.position
+            local dist_to_nest = calculate_distance(request.target_pos, nest_pos)
+            if dist_to_nest < 5 then  -- Target position is near the nest
+                is_nest_target = true
+            end
+        end
+        if not is_nest_target and creeper.target and creeper.target.valid then
+            local target_pos = creeper.target.position
+            local dist_to_target = calculate_distance(request.target_pos, target_pos)
+            if dist_to_target < 5 and (creeper.target.type == "unit-spawner" or creeper.target.type == "turret") then
+                is_nest_target = true
+            end
+        end
+        
+        -- If this is a nest target with too many waypoints, it's not a threat - clear it and return to scouting
+        if is_nest_target and party and not is_distractor then
+            -- Get nest position for tracking
+            local nest_pos = nil
+            if party.target_nest and party.target_nest.valid then
+                nest_pos = party.target_nest.position
+            elseif creeper.target and creeper.target.valid then
+                nest_pos = creeper.target.position
+            end
+            
+            log("Nest target rejected: too many waypoints (" .. #safe_waypoints .. ") - nest is not a threat (on other side of obstacle)" .. (nest_pos and " at (" .. string.format("%.1f", nest_pos.x) .. ", " .. string.format("%.1f", nest_pos.y) .. ")" or ""))
+            
+            -- Track rejected nest to prevent re-detection loop
+            if nest_pos then
+                party.rejected_nests = party.rejected_nests or {}
+                local nest_key = string.format("%.1f,%.1f", nest_pos.x, nest_pos.y)
+                party.rejected_nests[nest_key] = game.tick
+                log("Marked nest at (" .. string.format("%.1f", nest_pos.x) .. ", " .. string.format("%.1f", nest_pos.y) .. ") as rejected, will ignore for 50 seconds")
+            end
+            
+            -- Clear nest target from party
+            if party.target_nest then
+                party.target_nest = nil
+            end
+            party.target_health = nil
+            party.target_max_health = nil
+            party.attack_initiated = false
+            party.scout_sent = false
+            
+            -- Clear target from all party members and transition back to scouting
+            for unit_number, member in pairs(storage.creeperbots or {}) do
+                if member.party_id == creeper.party_id and member.entity and member.entity.valid then
+                    if member.state == "preparing_to_attack" or member.state == "approaching" then
+                        member.target = nil
+                        member.target_position = nil
+                        member.target_health = nil
+                        member.assigned_target = nil
+                        member.state = member.is_guard and "guard" or "scouting"
+                        update_color(member.entity, member.state)
+                        member.entity.follow_target = nil
+                        member.entity.autopilot_destination = nil
+                        if storage.scheduled_autopilots and storage.scheduled_autopilots[unit_number] then
+                            storage.scheduled_autopilots[unit_number] = nil
+                        end
+                    end
+                end
+            end
+            
+            -- Transition party back to scouting
+            if party then
+                party.state = "scouting"
+            end
+            
+            storage.path_requests[event.id] = nil
+            return
+        end
+        
+        -- For scouting paths, mark this chunk as visited and find a closer one
+        if (creeper.state == "scouting" or (party and party.state == "scouting")) and not is_distractor then
+            -- Mark the target chunk as visited so it's less likely to be selected again
+            local chunk_key = request.chunk_x .. "," .. request.chunk_y
+            if party and party.visited_chunks then
+                party.visited_chunks[chunk_key] = (party.visited_chunks[chunk_key] or 0) + 1
+            end
+            
+            -- Find a closer unvisited chunk
+            local current_pos = creeper.entity.position
+            local closer_target = get_unvisited_chunk(current_pos, party)
+            
+            -- Verify the closer target is actually different
+            if closer_target.x ~= current_pos.x or closer_target.y ~= current_pos.y then
+                local dist_to_original = calculate_distance(current_pos, request.target_pos)
+                local dist_to_closer = calculate_distance(current_pos, closer_target)
+                log("Finding closer target: original distance " .. string.format("%.1f", dist_to_original) .. ", new distance " .. string.format("%.1f", dist_to_closer))
+                -- Request path to closer target (even if not strictly closer, it's a different chunk that might have a better path)
+                request_multiple_paths(current_pos, closer_target, party, surface, creeper.unit_number)
+            else
+                log("No closer chunk found, will retry later")
+            end
+        end
+        
+        storage.path_requests[event.id] = nil
+        return
+    end
+    
     creeper.entity.autopilot_destination = nil
     for _, waypoint_pos in ipairs(safe_waypoints) do
         creeper.entity.add_autopilot_destination(waypoint_pos)
     end
     
-    if skipped_water > 0 then
-        log("Set " .. #safe_waypoints .. " safe autopilot destinations for unit " .. request.creeper_unit_number .. " (skipped " .. skipped_water .. " water waypoints) to (" .. request.target_pos.x .. "," .. request.target_pos.y .. ")")
+    if skipped_water > 0 or skipped_cliffs > 0 then
+        log("Set " .. #safe_waypoints .. " safe autopilot destinations for unit " .. request.creeper_unit_number .. 
+            " (skipped " .. skipped_water .. " water, " .. skipped_cliffs .. " cliff-problematic waypoints) to (" .. 
+            request.target_pos.x .. "," .. request.target_pos.y .. ")")
     else
         log("Set " .. #safe_waypoints .. " autopilot destinations for unit " .. request.creeper_unit_number .. " (state: " .. (creeper.state or "nil") .. ") to (" .. request.target_pos.x .. "," .. request.target_pos.y .. ")")
     end

@@ -350,13 +350,12 @@ function preparing_to_attack_state.handle_preparing_to_attack_state(creeper, eve
                 local bots_to_send = required_bots - attacking_count
                 
                 if bots_to_send > 0 then
-                    -- Find available bots to send (excluding scout and leader)
+                    -- Find available bots to send (excluding scout, but including leader)
                     local available_bots = {}
                     for _, member in ipairs(members) do
                         if member.entity and member.entity.valid and 
                            member.state == "preparing_to_attack" and 
-                           member.unit_number ~= party.scout_unit_number and
-                           not member.is_leader then
+                           member.unit_number ~= party.scout_unit_number then
                             table.insert(available_bots, member)
                         end
                     end
@@ -436,14 +435,14 @@ function preparing_to_attack_state.handle_preparing_to_attack_state(creeper, eve
     -- ============================================
     -- Only send remaining bots if target is still alive and we haven't sent enough
     -- This is a fallback in case the calculation-based system didn't send enough bots
+    -- Leader can also attack
     if party.attack_initiated and 
        party.attack_start_tick and 
        party.target_nest and
        party.target_nest.valid and
        party.target_nest.health > 0 and
        event.tick >= party.attack_start_tick + 180 and  -- Wait 3 seconds after scout
-       creeper.state == "preparing_to_attack" and
-       not creeper.is_leader then
+       creeper.state == "preparing_to_attack" then
        
         -- Re-get members list to ensure it's current
         -- Include all bots except the active distractor (in "distractor" state)
